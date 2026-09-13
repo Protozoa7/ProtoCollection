@@ -8,6 +8,7 @@ import {
   setDoc
 } from 'firebase/firestore'
 import { db, firebaseConfigured } from './firebase'
+import { parseLanguage } from './languages'
 
 const LOCAL_KEY = 'protocollection-local-v1'
 
@@ -24,16 +25,60 @@ function writeLocal(data) {
   window.dispatchEvent(new CustomEvent('protocollection-local-change'))
 }
 
-function normalizeEntry(card, quantity = 1) {
+function cleanDimension(value, fallback = 'Unspecified') {
+  const text = String(value || '').trim()
+  return text || fallback
+}
+
+function slug(value) {
+  return String(value || 'unspecified')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 50) || 'unspecified'
+}
+
+export function identityKey(card, options = {}) {
+  const lang = parseLanguage(options.language || card.language, 'en') || 'en'
+  const variant = cleanDimension(options.variant ?? card.variant)
+  const condition = cleanDimension(options.condition ?? card.condition)
+  const id = card.cardId || card.id
+
+  // Backward compatibility with ProtoCollection V1:
+  // its default English records used the raw catalog card ID as the Firestore document ID.
+  if (lang === 'en' && variant === 'Unspecified' && condition === 'Unspecified') return id
+
+  return `${lang}__${id}__${slug(variant)}__${slug(condition)}`
+}
+
+export function catalogQuantity(items, card, langOverride) {
+  const id = card.cardId || card.id
+  const lang = parseLanguage(langOverride || card.language, 'en') || 'en'
+  return Object.values(items).reduce((sum, entry) => {
+    if ((entry.cardId || '') === id && (entry.language || 'en') === lang) {
+      return sum + Number(entry.quantity || 0)
+    }
+    return sum
+  }, 0)
+}
+
+function normalizeEntry(card, quantity = 1, options = {}) {
+  const language = parseLanguage(options.language || card.language, 'en') || 'en'
+  const variant = cleanDimension(options.variant ?? card.variant)
+  const condition = cleanDimension(options.condition ?? card.condition)
+
   return {
-    cardId: card.id,
+    cardId: card.cardId || card.id,
     name: card.name || '',
     localId: card.localId || '',
     image: card.image || '',
     setId: card.setId || card.set?.id || '',
     setName: card.setName || card.set?.name || '',
     quantity,
-    language: 'en'
+    language,
+    variant,
+    condition
   }
 }
 
@@ -42,7 +87,10 @@ export function subscribeCollection(user, callback) {
     const ref = collection(db, 'users', user.uid, 'collection')
     return onSnapshot(ref, snap => {
       const data = {}
-      snap.forEach(d => { data[d.id] = { ...d.data(), cardId: d.id } })
+      snap.forEach(d => {
+        const row = d.data()
+        data[d.id] = { ...row, identityKey: d.id, language: row.language || 'en' }
+      })
       callback(data)
     })
   }
@@ -57,48 +105,55 @@ export function subscribeCollection(user, callback) {
   }
 }
 
-export async function addCard(user, card, amount = 1) {
-  if (!card?.id || amount <= 0) return
+export async function addCard(user, card, amount = 1, options = {}) {
+  if (!(card?.id || card?.cardId) || amount <= 0) return
+  const entry = normalizeEntry(card, amount, options)
+  const key = identityKey(entry)
+
   if (firebaseConfigured && db && user) {
-    const ref = doc(db, 'users', user.uid, 'collection', card.id)
-    const entry = normalizeEntry(card, amount)
+    const ref = doc(db, 'users', user.uid, 'collection', key)
     await setDoc(ref, {
       ...entry,
       quantity: increment(amount),
       updatedAt: serverTimestamp()
     }, { merge: true })
-    return
+    return key
   }
 
   const data = readLocal()
-  const existing = data[card.id]
-  data[card.id] = normalizeEntry(card, (existing?.quantity || 0) + amount)
+  const existing = data[key]
+  data[key] = {
+    ...entry,
+    identityKey: key,
+    quantity: Number(existing?.quantity || 0) + amount
+  }
   writeLocal(data)
+  return key
 }
 
-export async function setQuantity(user, card, quantity) {
-  if (!card?.cardId && !card?.id) return
-  const id = card.cardId || card.id
+export async function setQuantity(user, entry, quantity) {
+  const key = entry.identityKey || identityKey(entry)
   if (quantity <= 0) {
     if (firebaseConfigured && db && user) {
-      await deleteDoc(doc(db, 'users', user.uid, 'collection', id))
+      await deleteDoc(doc(db, 'users', user.uid, 'collection', key))
     } else {
       const data = readLocal()
-      delete data[id]
+      delete data[key]
       writeLocal(data)
     }
     return
   }
 
+  const normalized = normalizeEntry(entry, quantity)
   if (firebaseConfigured && db && user) {
-    await setDoc(doc(db, 'users', user.uid, 'collection', id), {
-      ...normalizeEntry({ ...card, id }, quantity),
+    await setDoc(doc(db, 'users', user.uid, 'collection', key), {
+      ...normalized,
       quantity,
       updatedAt: serverTimestamp()
     }, { merge: true })
   } else {
     const data = readLocal()
-    data[id] = normalizeEntry({ ...card, id }, quantity)
+    data[key] = { ...normalized, identityKey: key, quantity }
     writeLocal(data)
   }
 }

@@ -12,7 +12,7 @@ export default defineConfig({
       manifest: {
         name: 'ProtoCollection',
         short_name: 'ProtoCollection',
-        description: 'Personal Pokémon card digital binder',
+        description: 'Personal multilingual Pokémon card digital binder',
         theme_color: '#0b1220',
         background_color: '#07101c',
         display: 'standalone',
@@ -29,7 +29,7 @@ export default defineConfig({
             handler: 'CacheFirst',
             options: {
               cacheName: 'tcgdex-card-images',
-              expiration: { maxEntries: 500, maxAgeSeconds: 60 * 60 * 24 * 30 },
+              expiration: { maxEntries: 900, maxAgeSeconds: 60 * 60 * 24 * 30 },
               cacheableResponse: { statuses: [0, 200] }
             }
           },
@@ -39,7 +39,7 @@ export default defineConfig({
             options: {
               cacheName: 'tcgdex-api',
               networkTimeoutSeconds: 5,
-              expiration: { maxEntries: 250, maxAgeSeconds: 60 * 60 * 24 * 7 }
+              expiration: { maxEntries: 500, maxAgeSeconds: 60 * 60 * 24 * 7 }
             }
           }
         ]

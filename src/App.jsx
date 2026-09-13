@@ -1,16 +1,18 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ArrowLeft, BookOpen, Camera, Check, ChevronRight, Download, FileUp,
+  ArrowLeft, BookOpen, Camera, Check, ChevronRight, Download, FileDown, FileUp,
   Grid3X3, Layers3, LoaderCircle, LogIn, LogOut, Minus, Plus, Search,
   Settings, Sparkles, X
 } from 'lucide-react'
 import * as XLSX from 'xlsx'
 import { createWorker } from 'tesseract.js'
 import { auth, firebaseConfigured, onAuthStateChanged, signIn, signOut } from './firebase'
-import { addCard, setQuantity, subscribeCollection } from './collectionStore'
+import { addCard, catalogQuantity, setQuantity, subscribeCollection } from './collectionStore'
 import {
-  assetImage, candidatesFromOcr, cardImage, getSet, getSets, hydrateCard, searchCards
+  assetImage, candidatesFromOcr, cardImage, findCardForImport, getSet, getSets,
+  hydrateCard, scannerOcrLanguage, searchCards
 } from './tcgdex'
+import { LANGUAGES, languageLabel, languageShort, parseLanguage } from './languages'
 
 const tabs = [
   { id: 'collection', label: 'Binder', icon: BookOpen },
@@ -20,77 +22,131 @@ const tabs = [
   { id: 'more', label: 'More', icon: Settings }
 ]
 
+const ACTIVE_LANGUAGES = LANGUAGES.filter(l =>
+  ['en','ja','zh-cn','zh-tw','ko','th','fr','es','de','it','pt-br','id'].includes(l.code)
+)
+
 function useCollection(user) {
   const [items, setItems] = useState({})
   useEffect(() => subscribeCollection(user, setItems), [user])
   return [items, setItems]
 }
 
-function quantityOf(items, id) {
-  return Number(items[id]?.quantity || 0)
+function LanguageSelect({ value, onChange, includeAll = false, className = '' }) {
+  return (
+    <select className={`language-select ${className}`} value={value} onChange={e => onChange(e.target.value)}>
+      {includeAll && <option value="all">All languages</option>}
+      {ACTIVE_LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
+    </select>
+  )
 }
 
-function CardTile({ card, items, user, onOpen, compact = false }) {
-  const qty = quantityOf(items, card.id || card.cardId)
+function CardTile({ card, items, user, onOpen, collectionEntry = false }) {
+  const lang = card.language || 'en'
+  const qty = collectionEntry
+    ? Number(card.quantity || 0)
+    : catalogQuantity(items, card, lang)
   const [busy, setBusy] = useState(false)
 
   async function quickAdd(e) {
     e.stopPropagation()
     setBusy(true)
     try {
-      const full = card.setName ? card : await hydrateCard(card)
-      await addCard(user, full, 1)
+      const full = card.setName && card.image ? card : await hydrateCard(card, lang)
+      await addCard(user, full, 1, { language: lang })
     } finally {
       setBusy(false)
     }
   }
 
-  const img = cardImage(card, compact ? 'low' : 'low')
   return (
     <article className={`card-tile ${qty ? 'owned' : ''}`} onClick={() => onOpen?.(card)}>
       <div className="card-image-shell">
-        {img ? <img src={img} alt={card.name} loading="lazy" /> : <div className="image-placeholder">No image</div>}
+        {cardImage(card, 'low')
+          ? <img src={cardImage(card, 'low')} alt={card.name} loading="lazy" />
+          : <div className="image-placeholder">No image</div>}
+        <span className="language-badge">{languageShort(lang)}</span>
         {qty > 0 && <span className="owned-badge"><Check size={13}/> {qty}</span>}
       </div>
       <div className="card-tile-body">
         <div className="card-name">{card.name}</div>
-        <div className="card-sub">#{card.localId}{card.setName ? ` · ${card.setName}` : ''}</div>
-        <button className={`quick-add ${qty ? 'has' : ''}`} onClick={quickAdd} disabled={busy}>
-          {busy ? <LoaderCircle className="spin" size={16}/> : <Plus size={17}/>}
-          {qty ? 'Add another' : 'Add'}
-        </button>
+        <div className="card-sub">
+          #{card.localId}{card.setName ? ` · ${card.setName}` : ''}
+        </div>
+        {collectionEntry && (
+          <div className="card-meta-line">
+            {card.variant && card.variant !== 'Unspecified' && <span>{card.variant}</span>}
+            {card.condition && card.condition !== 'Unspecified' && <span>{card.condition}</span>}
+          </div>
+        )}
+        {!collectionEntry && (
+          <button className={`quick-add ${qty ? 'has' : ''}`} onClick={quickAdd} disabled={busy}>
+            {busy ? <LoaderCircle className="spin" size={16}/> : <Plus size={17}/>}
+            {qty ? 'Add another' : 'Add'}
+          </button>
+        )}
       </div>
     </article>
   )
 }
 
 function CardSheet({ card, items, user, onClose }) {
-  const id = card?.id || card?.cardId
-  const current = items[id] || card
-  const qty = quantityOf(items, id)
+  const isEntry = Boolean(card.identityKey)
+  const lang = card.language || 'en'
   const [full, setFull] = useState(card)
+  const currentEntry = isEntry ? items[card.identityKey] : null
+  const qty = isEntry
+    ? Number(currentEntry?.quantity || card.quantity || 0)
+    : catalogQuantity(items, card, lang)
 
   useEffect(() => {
     let alive = true
-    hydrateCard(card).then(v => alive && setFull(v))
+    hydrateCard(card, lang).then(v => alive && setFull(v))
     return () => { alive = false }
-  }, [id])
+  }, [card.cardId, card.id, lang])
 
-  if (!card) return null
+  async function addOne() {
+    await addCard(user, full, 1, {
+      language: lang,
+      variant: isEntry ? card.variant : 'Unspecified',
+      condition: isEntry ? card.condition : 'Unspecified'
+    })
+  }
+
+  async function removeOne() {
+    if (isEntry) {
+      await setQuantity(user, currentEntry || card, Math.max(0, qty - 1))
+      return
+    }
+    const matching = Object.values(items).find(x =>
+      x.cardId === (card.cardId || card.id) &&
+      (x.language || 'en') === lang
+    )
+    if (matching) await setQuantity(user, matching, Math.max(0, Number(matching.quantity || 0) - 1))
+  }
+
   return (
     <div className="sheet-backdrop" onClick={onClose}>
       <div className="sheet" onClick={e => e.stopPropagation()}>
         <button className="icon-btn close" onClick={onClose}><X/></button>
-        <img className="sheet-card-image" src={cardImage(full, 'high')} alt={full.name}/>
+        {cardImage(full, 'high') && <img className="sheet-card-image" src={cardImage(full, 'high')} alt={full.name}/>}
         <div className="sheet-content">
-          <span className="eyebrow">{full.set?.name || full.setName || current?.setName || 'Pokémon TCG'}</span>
+          <div className="detail-badges">
+            <span>{languageLabel(lang)}</span>
+            {isEntry && card.variant && card.variant !== 'Unspecified' && <span>{card.variant}</span>}
+            {isEntry && card.condition && card.condition !== 'Unspecified' && <span>{card.condition}</span>}
+          </div>
+          <span className="eyebrow">{full.set?.name || full.setName || card.setName || 'Pokémon TCG'}</span>
           <h2>{full.name}</h2>
           <p className="muted">Collector #{full.localId}</p>
           <div className="qty-control">
-            <button onClick={() => setQuantity(user, { ...current, ...full, cardId: id }, Math.max(0, qty - 1))}><Minus/></button>
+            <button onClick={removeOne}><Minus/></button>
             <div><strong>{qty}</strong><span>owned</span></div>
-            <button onClick={async () => addCard(user, await hydrateCard(full), 1)}><Plus/></button>
+            <button onClick={addOne}><Plus/></button>
           </div>
+          {!isEntry && qty > 0 && (
+            <p className="sheet-note">Quantity shown is the total for this card in {languageLabel(lang)} across variants/conditions.</p>
+          )}
         </div>
       </div>
     </div>
@@ -99,20 +155,32 @@ function CardSheet({ card, items, user, onClose }) {
 
 function CollectionView({ items, user, onOpen }) {
   const [query, setQuery] = useState('')
+  const [lang, setLang] = useState('all')
   const [sort, setSort] = useState('name')
+
   const list = useMemo(() => {
     const q = query.toLowerCase().trim()
-    let out = Object.values(items).filter(x =>
-      !q || x.name?.toLowerCase().includes(q) || x.setName?.toLowerCase().includes(q) || String(x.localId).toLowerCase().includes(q)
-    )
+    let out = Object.values(items).filter(x => {
+      const languageOk = lang === 'all' || (x.language || 'en') === lang
+      const queryOk = !q ||
+        x.name?.toLowerCase().includes(q) ||
+        x.setName?.toLowerCase().includes(q) ||
+        String(x.localId).toLowerCase().includes(q) ||
+        String(x.variant || '').toLowerCase().includes(q)
+      return languageOk && queryOk
+    })
     out.sort((a, b) => {
       if (sort === 'qty') return (b.quantity || 0) - (a.quantity || 0) || a.name.localeCompare(b.name)
       if (sort === 'set') return (a.setName || '').localeCompare(b.setName || '') || a.name.localeCompare(b.name)
+      if (sort === 'lang') return (a.language || 'en').localeCompare(b.language || 'en') || a.name.localeCompare(b.name)
       return a.name.localeCompare(b.name)
     })
     return out
-  }, [items, query, sort])
-  const total = Object.values(items).reduce((s, x) => s + Number(x.quantity || 0), 0)
+  }, [items, query, lang, sort])
+
+  const allEntries = Object.values(items)
+  const total = allEntries.reduce((s, x) => s + Number(x.quantity || 0), 0)
+  const uniqueCards = new Set(allEntries.map(x => `${x.language || 'en'}::${x.cardId}`)).size
 
   return (
     <>
@@ -120,24 +188,36 @@ function CollectionView({ items, user, onOpen }) {
         <div>
           <span className="eyebrow">MY DIGITAL BINDER</span>
           <h1>ProtoCollection</h1>
-          <p>{list.length === Object.keys(items).length ? Object.keys(items).length : list.length} unique · {total} total cards</p>
+          <p>{uniqueCards} unique cards · {total} total copies</p>
         </div>
         <div className="hero-orb"><Sparkles/></div>
       </section>
+
       <div className="searchbar">
-        <Search size={19}/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search your binder…" />
+        <Search size={19}/>
+        <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search your binder…" />
       </div>
-      <div className="toolbar">
-        <span>{list.length} cards</span>
+
+      <div className="filter-row">
+        <LanguageSelect value={lang} onChange={setLang} includeAll/>
         <select value={sort} onChange={e => setSort(e.target.value)}>
-          <option value="name">Name</option><option value="set">Set</option><option value="qty">Quantity</option>
+          <option value="name">Sort: Name</option>
+          <option value="set">Sort: Set</option>
+          <option value="qty">Sort: Quantity</option>
+          <option value="lang">Sort: Language</option>
         </select>
       </div>
+
+      <div className="toolbar"><span>{list.length} binder entries</span></div>
+
       {!list.length ? (
-        <Empty icon={BookOpen} title="Your binder is empty" text="Browse a set, search for a card, or use Scan to start adding cards."/>
+        <Empty icon={BookOpen} title="No cards here yet" text="Browse a set, search, scan, or import your collection."/>
       ) : (
         <div className="card-grid">
-          {list.map(card => <CardTile key={card.cardId} card={{...card, id: card.cardId}} items={items} user={user} onOpen={onOpen}/>)}
+          {list.map(card => (
+            <CardTile key={card.identityKey} card={card} items={items} user={user}
+              onOpen={onOpen} collectionEntry/>
+          ))}
         </div>
       )}
     </>
@@ -145,44 +225,57 @@ function CollectionView({ items, user, onOpen }) {
 }
 
 function SetsView({ items, user, onOpen }) {
+  const [lang, setLang] = useState('en')
   const [sets, setSets] = useState([])
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState(null)
   const [setData, setSetData] = useState(null)
   const [cardQuery, setCardQuery] = useState('')
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
 
   useEffect(() => {
-    getSets().then(setSets).finally(() => setLoading(false))
-  }, [])
+    setLoading(true); setError(''); setSelected(null); setSetData(null)
+    getSets(lang)
+      .then(setSets)
+      .catch(e => { setSets([]); setError(e.message) })
+      .finally(() => setLoading(false))
+  }, [lang])
 
   useEffect(() => {
     if (!selected) { setSetData(null); return }
-    setSetData(null)
-    getSet(selected.id).then(setSetData)
-  }, [selected?.id])
+    setSetData(null); setError('')
+    getSet(selected.id, lang)
+      .then(setSetData)
+      .catch(e => setError(e.message))
+  }, [selected?.id, lang])
 
   if (selected) {
     const cards = (setData?.cards || []).filter(c => {
       const q = cardQuery.toLowerCase().trim()
       return !q || c.name.toLowerCase().includes(q) || String(c.localId).toLowerCase().includes(q)
-    }).map(c => ({ ...c, setId: selected.id, setName: selected.name }))
+    }).map(c => ({ ...c, language: lang, setId: selected.id, setName: selected.name }))
+
     return (
       <>
         <button className="back-link" onClick={() => setSelected(null)}><ArrowLeft size={18}/> All sets</button>
         <section className="set-header">
           {setData?.logo && <img src={assetImage(setData.logo)} alt=""/>}
           <div>
-            <span className="eyebrow">{setData?.serie?.name || 'Pokémon TCG'}</span>
+            <span className="eyebrow">{languageLabel(lang).toUpperCase()}</span>
             <h1>{selected.name}</h1>
             <p>{setData?.releaseDate || `${selected.cardCount?.total || ''} cards`}</p>
           </div>
         </section>
         <div className="searchbar">
-          <Search size={19}/><input value={cardQuery} onChange={e => setCardQuery(e.target.value)} placeholder={`Search ${selected.name}…`} />
+          <Search size={19}/>
+          <input value={cardQuery} onChange={e => setCardQuery(e.target.value)} placeholder={`Search ${selected.name}…`} />
         </div>
-        {!setData ? <Loading text="Opening binder…"/> :
-          <div className="card-grid">{cards.map(c => <CardTile key={c.id} card={c} items={items} user={user} onOpen={onOpen}/>)}</div>
+        {error && <ErrorBox text={error}/>}
+        {!setData && !error ? <Loading text="Opening set…" /> :
+          <div className="card-grid">
+            {cards.map(c => <CardTile key={`${lang}-${c.id}`} card={c} items={items} user={user} onOpen={onOpen}/>)}
+          </div>
         }
       </>
     )
@@ -191,14 +284,19 @@ function SetsView({ items, user, onOpen }) {
   const filtered = sets.filter(s => s.name.toLowerCase().includes(query.toLowerCase()))
   return (
     <>
-      <PageTitle eyebrow="CARD CATALOG" title="Browse Sets" subtitle="Open any set and add cards straight to your binder."/>
+      <PageTitle eyebrow="MULTILINGUAL CARD CATALOG" title="Browse Sets" subtitle="Choose a language, open a set, and add cards directly to your binder."/>
+      <div className="language-toolbar">
+        <span>Catalog language</span>
+        <LanguageSelect value={lang} onChange={setLang}/>
+      </div>
       <div className="searchbar"><Search size={19}/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search sets…" /></div>
-      {loading ? <Loading text="Loading sets…"/> :
+      {error && <ErrorBox text={`${languageLabel(lang)} catalog unavailable or incomplete: ${error}`}/>}
+      {loading ? <Loading text={`Loading ${languageLabel(lang)} sets…`}/> :
         <div className="set-list">
           {filtered.map(set => (
-            <button key={set.id} className="set-row" onClick={() => setSelected(set)}>
+            <button key={`${lang}-${set.id}`} className="set-row" onClick={() => setSelected(set)}>
               <div className="set-logo-box">{set.logo ? <img src={assetImage(set.logo)} alt=""/> : <Layers3/>}</div>
-              <div className="set-row-copy"><strong>{set.name}</strong><span>{set.cardCount?.total || '?'} cards</span></div>
+              <div className="set-row-copy"><strong>{set.name}</strong><span>{set.cardCount?.total || '?'} cards · {languageShort(lang)}</span></div>
               <ChevronRight/>
             </button>
           ))}
@@ -209,26 +307,38 @@ function SetsView({ items, user, onOpen }) {
 }
 
 function SearchView({ items, user, onOpen }) {
+  const [lang, setLang] = useState('en')
   const [q, setQ] = useState('')
   const [results, setResults] = useState([])
   const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
 
   useEffect(() => {
-    if (q.trim().length < 2) { setResults([]); return }
+    if (q.trim().length < 2) { setResults([]); setError(''); return }
     const timer = setTimeout(async () => {
-      setLoading(true)
-      try { setResults(await searchCards(q)) } finally { setLoading(false) }
+      setLoading(true); setError('')
+      try { setResults(await searchCards(q, lang)) }
+      catch (e) { setResults([]); setError(e.message) }
+      finally { setLoading(false) }
     }, 350)
     return () => clearTimeout(timer)
-  }, [q])
+  }, [q, lang])
 
   return (
     <>
-      <PageTitle eyebrow="ALL CARDS" title="Find a Card" subtitle="Search by Pokémon name or collector number."/>
-      <div className="searchbar big"><Search size={20}/><input autoFocus value={q} onChange={e => setQ(e.target.value)} placeholder="Charizard, Pikachu, 199/165…" /></div>
-      {loading && <Loading text="Searching cards…"/>}
-      {!loading && q.length >= 2 && !results.length && <Empty icon={Search} title="No matches" text="Try the card name or collector number."/>}
-      <div className="card-grid">{results.map(c => <CardTile key={c.id} card={c} items={items} user={user} onOpen={onOpen}/>)}</div>
+      <PageTitle eyebrow="ALL CARDS" title="Find a Card" subtitle="Search one language catalog at a time by card name or collector number."/>
+      <div className="language-toolbar">
+        <span>Search language</span><LanguageSelect value={lang} onChange={setLang}/>
+      </div>
+      <div className="searchbar big">
+        <Search size={20}/><input autoFocus value={q} onChange={e => setQ(e.target.value)} placeholder="Name or collector number…" />
+      </div>
+      {error && <ErrorBox text={error}/>}
+      {loading && <Loading text={`Searching ${languageLabel(lang)} cards…`}/>}
+      {!loading && !error && q.length >= 2 && !results.length && <Empty icon={Search} title="No matches" text="Try the collector number, a different spelling, or another language."/>}
+      <div className="card-grid">
+        {results.map(c => <CardTile key={`${lang}-${c.id}`} card={{...c, language: lang}} items={items} user={user} onOpen={onOpen}/>)}
+      </div>
     </>
   )
 }
@@ -237,6 +347,7 @@ function ScannerView({ items, user, onOpen }) {
   const videoRef = useRef(null)
   const canvasRef = useRef(null)
   const streamRef = useRef(null)
+  const [lang, setLang] = useState('en')
   const [active, setActive] = useState(false)
   const [working, setWorking] = useState(false)
   const [progress, setProgress] = useState('')
@@ -279,25 +390,24 @@ function ScannerView({ items, user, onOpen }) {
     try {
       const w = video.videoWidth, h = video.videoHeight
       canvas.width = w; canvas.height = h
-      const ctx = canvas.getContext('2d')
-      ctx.drawImage(video, 0, 0, w, h)
+      canvas.getContext('2d').drawImage(video, 0, 0, w, h)
 
-      setProgress('Reading card text…')
-      const worker = await createWorker('eng', 1, {
+      setProgress(`Loading ${languageLabel(lang)} OCR…`)
+      const worker = await createWorker(scannerOcrLanguage(lang), 1, {
         logger: m => {
           if (m.status === 'recognizing text') setProgress(`Reading card… ${Math.round((m.progress || 0) * 100)}%`)
         }
       })
+
       const { data } = await worker.recognize(canvas)
       await worker.terminate()
       const text = data.text || ''
       setRawText(text)
 
-      setProgress('Matching card…')
-      const found = await candidatesFromOcr(text)
+      setProgress(`Matching against ${languageLabel(lang)} cards…`)
+      const found = await candidatesFromOcr(text, lang)
       setCandidates(found)
-      if (!found.length) setProgress('No confident match. Try closer, brighter, and flatter.')
-      else setProgress('')
+      setProgress(found.length ? '' : 'No confident match. Try closer, brighter, and flatter.')
     } catch (e) {
       setProgress(`Scan failed: ${e.message}`)
     } finally {
@@ -306,12 +416,11 @@ function ScannerView({ items, user, onOpen }) {
   }
 
   async function choose(card) {
-    const full = await hydrateCard(card)
-    await addCard(user, full, 1)
-    setLastAdded(`${full.name} · #${full.localId}`)
+    const full = await hydrateCard(card, lang)
+    await addCard(user, full, 1, { language: lang })
+    setLastAdded(`${full.name} · #${full.localId} · ${languageShort(lang)}`)
     if (rapid) {
-      setCandidates([])
-      setRawText('')
+      setCandidates([]); setRawText('')
       setProgress('Added. Ready for the next card.')
       setTimeout(() => setProgress(''), 1600)
     } else {
@@ -321,14 +430,17 @@ function ScannerView({ items, user, onOpen }) {
 
   return (
     <>
-      <PageTitle eyebrow="V1 CAMERA SCANNER" title="Rapid Scan" subtitle="Center one card in the frame. We read its text and match it to the catalog."/>
+      <PageTitle eyebrow="MULTILINGUAL CAMERA SCANNER" title="Rapid Scan" subtitle="Choose the card language first. The scanner uses that language's catalog and OCR model."/>
+      <div className="language-toolbar scanner-language">
+        <span>Card language</span><LanguageSelect value={lang} onChange={setLang}/>
+      </div>
       <div className="rapid-toggle">
         <div><strong>Rapid mode</strong><span>Stay in camera after each add</span></div>
         <button className={rapid ? 'toggle on' : 'toggle'} onClick={() => setRapid(!rapid)}><i/></button>
       </div>
       <div className="scanner">
         <video ref={videoRef} playsInline muted className={active ? '' : 'hidden'} />
-        {!active && <div className="camera-empty"><Camera size={44}/><p>Use your rear camera to identify a card.</p><button className="primary" onClick={startCamera}><Camera size={18}/> Open camera</button></div>}
+        {!active && <div className="camera-empty"><Camera size={44}/><p>Use your rear camera to identify a {languageLabel(lang)} card.</p><button className="primary" onClick={startCamera}><Camera size={18}/> Open camera</button></div>}
         {active && <div className="scan-frame"><span/><span/><span/><span/></div>}
         {active && <button className="camera-close" onClick={stopCamera}><X/></button>}
         {active && <button className="shutter" onClick={scanFrame} disabled={working}><span>{working ? <LoaderCircle className="spin"/> : <Camera/>}</span></button>}
@@ -338,18 +450,19 @@ function ScannerView({ items, user, onOpen }) {
       {progress && <div className="scan-status">{working && <LoaderCircle className="spin" size={18}/>} {progress}</div>}
       {candidates.length > 0 && (
         <section className="scan-results">
-          <div className="section-heading"><div><span className="eyebrow">LIKELY MATCHES</span><h2>Tap the correct card</h2></div><span>{candidates.length}</span></div>
+          <div className="section-heading"><div><span className="eyebrow">LIKELY {languageShort(lang)} MATCHES</span><h2>Tap the correct card</h2></div><span>{candidates.length}</span></div>
           <div className="candidate-grid">
             {candidates.map(c => (
-              <button key={c.id} onClick={() => choose(c)}>
-                <img src={cardImage(c, 'low')} alt={c.name}/><strong>{c.name}</strong><span>#{c.localId}</span>
+              <button key={`${lang}-${c.id}`} onClick={() => choose(c)}>
+                {cardImage(c, 'low') && <img src={cardImage(c, 'low')} alt={c.name}/>}
+                <strong>{c.name}</strong><span>#{c.localId}</span>
               </button>
             ))}
           </div>
           <details className="ocr-details"><summary>Show OCR text</summary><pre>{rawText}</pre></details>
         </section>
       )}
-      <div className="scanner-tip"><Sparkles/><div><strong>Scanner tip</strong><span>Bright, even lighting and a flat card work best. Collector numbers near the bottom of the card are especially useful.</span></div></div>
+      <div className="scanner-tip"><Sparkles/><div><strong>Scanner tip</strong><span>For Japanese, Chinese, Korean, and Thai cards, the collector number is especially valuable. Keep the bottom of the card sharp and glare-free.</span></div></div>
     </>
   )
 }
@@ -358,13 +471,17 @@ function MoreView({ items, user }) {
   const fileRef = useRef(null)
   const [importing, setImporting] = useState(false)
   const [importStatus, setImportStatus] = useState('')
+  const [unmatched, setUnmatched] = useState([])
 
   function exportCollection() {
     const rows = Object.values(items).map(x => ({
       'Card Name': x.name,
       'Set': x.setName,
       'Card Number': x.localId,
-      'Quantity': x.quantity
+      'Quantity': x.quantity,
+      'Language': languageShort(x.language || 'en'),
+      'Variant': x.variant === 'Unspecified' ? '' : x.variant,
+      'Condition': x.condition === 'Unspecified' ? '' : x.condition
     }))
     const ws = XLSX.utils.json_to_sheet(rows)
     const wb = XLSX.utils.book_new()
@@ -372,46 +489,65 @@ function MoreView({ items, user }) {
     XLSX.writeFile(wb, `ProtoCollection-${new Date().toISOString().slice(0,10)}.xlsx`)
   }
 
-  async function findMatch(row) {
+  function downloadUnmatched() {
+    if (!unmatched.length) return
+    const ws = XLSX.utils.json_to_sheet(unmatched)
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, ws, 'Needs Review')
+    XLSX.writeFile(wb, `ProtoCollection-Needs-Review-${new Date().toISOString().slice(0,10)}.xlsx`)
+  }
+
+  async function matchRow(row) {
     const name = row['Card Name'] ?? row['Name'] ?? row['Product Name'] ?? row['Product'] ?? ''
     const setName = row['Set'] ?? row['Set Name'] ?? row['Expansion'] ?? ''
-    const number = row['Card Number'] ?? row['Number'] ?? row['Collector Number'] ?? ''
-    const quantity = Number(row['Quantity'] ?? row['Qty'] ?? 1) || 1
+    const number = row['Card Number'] ?? row['Number'] ?? row['Collector Number'] ?? row['#'] ?? ''
+    const quantity = Math.max(1, Number(row['Quantity'] ?? row['Qty'] ?? 1) || 1)
+    const rawLanguage = row['Language'] ?? row['LANG'] ?? row['Lang'] ?? 'ENG'
+    const lang = parseLanguage(rawLanguage, 'en')
+    const variant = row['Variant'] ?? row['HOLO'] ?? row['Finish'] ?? ''
+    const condition = row['Condition'] ?? row['Card Condition'] ?? ''
 
-    if (setName) {
-      const sets = await getSets()
-      const set = sets.find(s => s.name.toLowerCase() === String(setName).trim().toLowerCase())
-        || sets.find(s => s.name.toLowerCase().includes(String(setName).trim().toLowerCase()))
-      if (set) {
-        const data = await getSet(set.id)
-        const card = data.cards?.find(c => String(c.localId).toLowerCase() === String(number).replace(/^#/, '').toLowerCase())
-          || data.cards?.find(c => c.name.toLowerCase() === String(name).trim().toLowerCase())
-        if (card) return { card: { ...card, setId: set.id, setName: set.name }, quantity }
-      }
+    if (!lang) {
+      return { error: `Unsupported/unknown language "${rawLanguage}"`, row }
     }
-    const found = await searchCards(number || name)
-    const exactName = found.find(c => c.name.toLowerCase() === String(name).trim().toLowerCase())
-    return found.length ? { card: exactName || found[0], quantity } : null
+
+    const card = await findCardForImport({ name, setName, number, lang })
+    if (!card) {
+      return { error: `No confident ${languageLabel(lang)} catalog match`, row }
+    }
+
+    return { card, quantity, lang, variant, condition }
   }
 
   async function handleImport(file) {
     if (!file) return
-    setImporting(true); setImportStatus('Reading spreadsheet…')
+    setImporting(true); setImportStatus('Reading spreadsheet…'); setUnmatched([])
     try {
       const data = await file.arrayBuffer()
       const wb = XLSX.read(data)
       const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' })
-      let added = 0, missed = 0
+      let copiesAdded = 0, matchedRows = 0
+      const misses = []
+
       for (let i = 0; i < rows.length; i++) {
-        setImportStatus(`Matching ${i + 1} of ${rows.length}…`)
-        const match = await findMatch(rows[i])
-        if (match) {
-          const full = await hydrateCard(match.card)
-          await addCard(user, full, match.quantity)
-          added += match.quantity
-        } else missed++
+        setImportStatus(`Matching row ${i + 1} of ${rows.length}…`)
+        const result = await matchRow(rows[i])
+        if (result.card) {
+          const full = await hydrateCard(result.card, result.lang)
+          await addCard(user, full, result.quantity, {
+            language: result.lang,
+            variant: result.variant,
+            condition: result.condition
+          })
+          copiesAdded += result.quantity
+          matchedRows++
+        } else {
+          misses.push({ ...rows[i], 'ProtoCollection Review Reason': result.error })
+        }
       }
-      setImportStatus(`Import complete: ${added} cards added${missed ? ` · ${missed} rows need manual review` : ''}.`)
+
+      setUnmatched(misses)
+      setImportStatus(`Import complete: ${copiesAdded} copies added from ${matchedRows} rows${misses.length ? ` · ${misses.length} rows need review` : ' · no review needed'}.`)
     } catch (e) {
       setImportStatus(`Import failed: ${e.message}`)
     } finally {
@@ -425,19 +561,35 @@ function MoreView({ items, user }) {
       <PageTitle eyebrow="TOOLS & ACCOUNT" title="More" subtitle="Import, export, sync, and account controls."/>
       <div className="settings-list">
         <button className="settings-row" onClick={() => fileRef.current?.click()} disabled={importing}>
-          <span className="settings-icon"><FileUp/></span><div><strong>Import collection</strong><span>CSV or XLSX, including common TCGplayer column names</span></div><ChevronRight/>
+          <span className="settings-icon"><FileUp/></span><div><strong>Import multilingual collection</strong><span>CSV/XLSX · language-aware matching</span></div><ChevronRight/>
         </button>
         <input ref={fileRef} type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={e => handleImport(e.target.files?.[0])}/>
+
         <button className="settings-row" onClick={exportCollection}>
-          <span className="settings-icon"><Download/></span><div><strong>Export collection</strong><span>Download your binder as an Excel spreadsheet</span></div><ChevronRight/>
+          <span className="settings-icon"><Download/></span><div><strong>Export collection</strong><span>Includes language, variant, and condition</span></div><ChevronRight/>
         </button>
+
+        {unmatched.length > 0 && (
+          <button className="settings-row review-row" onClick={downloadUnmatched}>
+            <span className="settings-icon"><FileDown/></span><div><strong>Download {unmatched.length} unmatched rows</strong><span>Keep a review file instead of losing ambiguous cards</span></div><ChevronRight/>
+          </button>
+        )}
+
         {firebaseConfigured && user && <button className="settings-row" onClick={signOut}>
           <span className="settings-icon"><LogOut/></span><div><strong>Sign out</strong><span>{user.email}</span></div><ChevronRight/>
         </button>}
       </div>
+
       {importStatus && <div className="import-status">{importing && <LoaderCircle className="spin"/>}{importStatus}</div>}
-      {!firebaseConfigured && <div className="setup-card"><strong>Local test mode</strong><p>Firebase has not been configured yet. Your binder is currently saved only in this browser. Follow README_FIRST.md to turn on cross-device sync.</p></div>}
-      {firebaseConfigured && <div className="setup-card good"><strong>Cloud sync enabled</strong><p>Firestore is configured. Collection changes use Firebase offline persistence and synchronize when connectivity returns.</p></div>}
+
+      <div className="supported-languages">
+        <strong>V1.1 catalog languages</strong>
+        <div>{ACTIVE_LANGUAGES.map(l => <span key={l.code}>{l.short}</span>)}</div>
+        <p>TCGdex completion varies by language. An unavailable card stays in the review file rather than being forced to the wrong match.</p>
+      </div>
+
+      {!firebaseConfigured && <div className="setup-card"><strong>Local test mode</strong><p>Firebase has not been configured yet. Your binder is currently saved only in this browser.</p></div>}
+      {firebaseConfigured && <div className="setup-card good"><strong>Cloud sync enabled</strong><p>Firestore is configured. Language is now part of each collection entry, so English, Japanese, Chinese, etc. copies remain distinct.</p></div>}
     </>
   )
 }
@@ -449,8 +601,11 @@ function AuthGate() {
       <div className="auth-logo"><Grid3X3/></div>
       <span className="eyebrow">PERSONAL DIGITAL BINDER</span>
       <h1>ProtoCollection</h1>
-      <p>One Pokémon collection, synchronized across your phone and computer.</p>
-      <button className="primary auth-btn" disabled={busy} onClick={async () => { setBusy(true); try { await signIn() } finally { setBusy(false) } }}>
+      <p>Your multilingual Pokémon collection synchronized across phone and computer.</p>
+      <button className="primary auth-btn" disabled={busy} onClick={async () => {
+        setBusy(true)
+        try { await signIn() } finally { setBusy(false) }
+      }}>
         {busy ? <LoaderCircle className="spin"/> : <LogIn/>} Continue with Google
       </button>
     </div>
@@ -474,9 +629,12 @@ function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <button className="brand" onClick={() => setTab('collection')}><span className="brand-mark"><Grid3X3/></span><span>ProtoCollection</span></button>
+        <button className="brand" onClick={() => setTab('collection')}>
+          <span className="brand-mark"><Grid3X3/></span><span>ProtoCollection</span>
+        </button>
         <span className={`sync-pill ${firebaseConfigured ? 'cloud' : ''}`}>{firebaseConfigured ? 'Cloud' : 'Local'}</span>
       </header>
+
       <main>
         {tab === 'collection' && <CollectionView items={items} user={user} onOpen={setOpenCard}/>}
         {tab === 'sets' && <SetsView items={items} user={user} onOpen={setOpenCard}/>}
@@ -484,6 +642,7 @@ function App() {
         {tab === 'search' && <SearchView items={items} user={user} onOpen={setOpenCard}/>}
         {tab === 'more' && <MoreView items={items} user={user}/>}
       </main>
+
       <nav className="bottom-nav">
         {tabs.map(({ id, label, icon: Icon, primary }) => (
           <button key={id} className={`${tab === id ? 'active' : ''} ${primary ? 'primary-tab' : ''}`} onClick={() => setTab(id)}>
@@ -491,6 +650,7 @@ function App() {
           </button>
         ))}
       </nav>
+
       {openCard && <CardSheet card={openCard} items={items} user={user} onClose={() => setOpenCard(null)}/>}
     </div>
   )
@@ -499,11 +659,17 @@ function App() {
 function PageTitle({ eyebrow, title, subtitle }) {
   return <section className="page-title"><span className="eyebrow">{eyebrow}</span><h1>{title}</h1><p>{subtitle}</p></section>
 }
+
 function Loading({ text }) {
   return <div className="loading"><LoaderCircle className="spin"/><span>{text}</span></div>
 }
+
 function Empty({ icon: Icon, title, text }) {
   return <div className="empty"><span><Icon/></span><h3>{title}</h3><p>{text}</p></div>
+}
+
+function ErrorBox({ text }) {
+  return <div className="error-box">{text}</div>
 }
 
 export default App
