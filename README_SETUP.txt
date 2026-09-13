@@ -1,8 +1,17 @@
-ProtoCollection V1.2 — Scanner + Safe Imports
+ProtoCollection V1.2.1 — Binder Variant Controls + V1.2 Scanner/Safe Imports
 =============================================
 
-WHAT CHANGED
-------------
+WHAT CHANGED IN V1.2.1
+----------------------
+- The main Binder now groups the same catalog card together by language.
+- All owned variants/conditions display directly under the card image.
+- Every variant has inline − / quantity / + buttons.
+- Tapping − at quantity 1 removes that exact variant entry from the binder.
+- Tapping + adds another copy of that exact language/variant/condition.
+- Binder search now also searches variant and condition text.
+
+V1.2 FEATURES RETAINED
+----------------------
 1. Imports no longer write to your binder immediately.
    Upload -> automatic matching -> in-app review queue -> explicit Confirm Import.
 
@@ -40,16 +49,12 @@ For best scanner accuracy:
 
 UPDATE YOUR EXISTING GITHUB REPOSITORY
 --------------------------------------
-Use the UPDATE-ONLY ZIP.
+Use the V1.2.1 UPDATE-ONLY ZIP.
 
 Replace these files/folders in your existing repo:
 - src/App.jsx
-- src/collectionStore.js
-- src/tcgdex.js
 - src/styles.css
 - package.json
-- vite.config.js
-- .github/workflows/deploy.yml
 
 Your existing files that are NOT in the update package should stay in place, especially:
 - src/firebaseConfig.js
@@ -92,3 +97,13 @@ The current rule matching /users/{userId}/{document=**} already covers the new /
 LOCAL TEST MODE
 ---------------
 The same staged/confirm/reverse workflow works locally if Firebase is not configured. Local data remains browser-specific.
+
+
+V1.2.1 UPDATE-ONLY FILES
+------------------------
+For an existing V1.2 installation, only replace:
+- src/App.jsx
+- src/styles.css
+- package.json
+
+No Firebase changes or Firestore rule changes are required.

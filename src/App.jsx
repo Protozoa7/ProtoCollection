@@ -93,6 +93,91 @@ function CardTile({ card, items, user, onOpen, collectionEntry = false }) {
   )
 }
 
+function BinderCardTile({ group, user, onOpen }) {
+  const [busyKey, setBusyKey] = useState('')
+  const primary = group.entries[0]
+  const totalQty = group.entries.reduce((sum, entry) => sum + Number(entry.quantity || 0), 0)
+
+  function variantLabel(entry) {
+    const variant = entry.variant && entry.variant !== 'Unspecified' ? entry.variant : 'Standard'
+    const condition = entry.condition && entry.condition !== 'Unspecified' ? entry.condition : ''
+    return condition ? `${variant} · ${condition}` : variant
+  }
+
+  async function adjustQuantity(e, entry, delta) {
+    e.stopPropagation()
+    const key = entry.identityKey || `${entry.language || 'en'}::${entry.cardId}`
+    setBusyKey(key)
+    try {
+      if (delta > 0) {
+        await addCard(user, entry, 1, {
+          language: entry.language || 'en',
+          variant: entry.variant || 'Unspecified',
+          condition: entry.condition || 'Unspecified'
+        })
+      } else {
+        await setQuantity(user, entry, Math.max(0, Number(entry.quantity || 0) - 1))
+      }
+    } finally {
+      setBusyKey('')
+    }
+  }
+
+  return (
+    <article className="card-tile binder-card-tile owned">
+      <button className="binder-card-open" onClick={() => onOpen?.(primary)} aria-label={`Open ${primary.name}`}>
+        <div className="card-image-shell">
+          {cardImage(primary, 'low')
+            ? <img src={cardImage(primary, 'low')} alt={primary.name} loading="lazy" />
+            : <div className="image-placeholder">No image</div>}
+          <span className="language-badge">{languageShort(primary.language || 'en')}</span>
+          <span className="owned-badge"><Check size={13}/> {totalQty}</span>
+        </div>
+        <div className="binder-card-heading">
+          <div className="card-name">{primary.name}</div>
+          <div className="card-sub">#{primary.localId}{primary.setName ? ` · ${primary.setName}` : ''}</div>
+        </div>
+      </button>
+
+      <div className="variant-list" aria-label={`${primary.name} variants`}>
+        {group.entries.map(entry => {
+          const key = entry.identityKey || `${entry.language || 'en'}::${entry.cardId}`
+          const busy = busyKey === key
+          return (
+            <div className="variant-row" key={key}>
+              <div className="variant-copy">
+                <strong>{variantLabel(entry)}</strong>
+                {group.entries.length > 1 && <span>{Number(entry.quantity || 0)} owned</span>}
+              </div>
+              <div className="mini-qty" onClick={e => e.stopPropagation()}>
+                <button
+                  type="button"
+                  className="mini-qty-btn remove"
+                  onClick={e => adjustQuantity(e, entry, -1)}
+                  disabled={busy}
+                  aria-label={`Remove one ${variantLabel(entry)}`}
+                >
+                  {busy ? <LoaderCircle className="spin" size={13}/> : <Minus size={14}/>} 
+                </button>
+                <span>{Number(entry.quantity || 0)}</span>
+                <button
+                  type="button"
+                  className="mini-qty-btn add"
+                  onClick={e => adjustQuantity(e, entry, 1)}
+                  disabled={busy}
+                  aria-label={`Add one ${variantLabel(entry)}`}
+                >
+                  {busy ? <LoaderCircle className="spin" size={13}/> : <Plus size={14}/>} 
+                </button>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </article>
+  )
+}
+
 function CardSheet({ card, items, user, onClose }) {
   const isEntry = Boolean(card.identityKey)
   const lang = card.language || 'en'
@@ -161,29 +246,56 @@ function CollectionView({ items, user, onOpen }) {
   const [lang, setLang] = useState('all')
   const [sort, setSort] = useState('name')
 
+  const groups = useMemo(() => {
+    const grouped = new Map()
+    for (const entry of Object.values(items)) {
+      const groupKey = `${entry.language || 'en'}::${entry.cardId}`
+      if (!grouped.has(groupKey)) grouped.set(groupKey, { key: groupKey, entries: [] })
+      grouped.get(groupKey).entries.push(entry)
+    }
+
+    for (const group of grouped.values()) {
+      group.entries.sort((a, b) => {
+        const av = a.variant && a.variant !== 'Unspecified' ? a.variant : 'Standard'
+        const bv = b.variant && b.variant !== 'Unspecified' ? b.variant : 'Standard'
+        return av.localeCompare(bv) || String(a.condition || '').localeCompare(String(b.condition || ''))
+      })
+      group.primary = group.entries[0]
+      group.totalQty = group.entries.reduce((sum, x) => sum + Number(x.quantity || 0), 0)
+    }
+    return [...grouped.values()]
+  }, [items])
+
   const list = useMemo(() => {
     const q = query.toLowerCase().trim()
-    let out = Object.values(items).filter(x => {
+    let out = groups.filter(group => {
+      const x = group.primary
       const languageOk = lang === 'all' || (x.language || 'en') === lang
       const queryOk = !q ||
         x.name?.toLowerCase().includes(q) ||
         x.setName?.toLowerCase().includes(q) ||
         String(x.localId).toLowerCase().includes(q) ||
-        String(x.variant || '').toLowerCase().includes(q)
+        group.entries.some(entry =>
+          String(entry.variant || '').toLowerCase().includes(q) ||
+          String(entry.condition || '').toLowerCase().includes(q)
+        )
       return languageOk && queryOk
     })
+
     out.sort((a, b) => {
-      if (sort === 'qty') return (b.quantity || 0) - (a.quantity || 0) || a.name.localeCompare(b.name)
-      if (sort === 'set') return (a.setName || '').localeCompare(b.setName || '') || a.name.localeCompare(b.name)
-      if (sort === 'lang') return (a.language || 'en').localeCompare(b.language || 'en') || a.name.localeCompare(b.name)
-      return a.name.localeCompare(b.name)
+      const ax = a.primary, bx = b.primary
+      if (sort === 'qty') return b.totalQty - a.totalQty || ax.name.localeCompare(bx.name)
+      if (sort === 'set') return (ax.setName || '').localeCompare(bx.setName || '') || ax.name.localeCompare(bx.name)
+      if (sort === 'lang') return (ax.language || 'en').localeCompare(bx.language || 'en') || ax.name.localeCompare(bx.name)
+      return ax.name.localeCompare(bx.name)
     })
     return out
-  }, [items, query, lang, sort])
+  }, [groups, query, lang, sort])
 
   const allEntries = Object.values(items)
   const total = allEntries.reduce((s, x) => s + Number(x.quantity || 0), 0)
-  const uniqueCards = new Set(allEntries.map(x => `${x.language || 'en'}::${x.cardId}`)).size
+  const uniqueCards = groups.length
+  const variantCount = allEntries.length
 
   return (
     <>
@@ -191,14 +303,14 @@ function CollectionView({ items, user, onOpen }) {
         <div>
           <span className="eyebrow">MY DIGITAL BINDER</span>
           <h1>ProtoCollection</h1>
-          <p>{uniqueCards} unique cards · {total} total copies</p>
+          <p>{uniqueCards} unique cards · {variantCount} variants · {total} total copies</p>
         </div>
         <div className="hero-orb"><Sparkles/></div>
       </section>
 
       <div className="searchbar">
         <Search size={19}/>
-        <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search your binder…" />
+        <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search cards, sets, or variants…" />
       </div>
 
       <div className="filter-row">
@@ -211,15 +323,14 @@ function CollectionView({ items, user, onOpen }) {
         </select>
       </div>
 
-      <div className="toolbar"><span>{list.length} binder entries</span></div>
+      <div className="toolbar"><span>{list.length} cards shown</span><span className="binder-hint">Use − / + to edit copies</span></div>
 
       {!list.length ? (
         <Empty icon={BookOpen} title="No cards here yet" text="Browse a set, search, scan, or import your collection."/>
       ) : (
-        <div className="card-grid">
-          {list.map(card => (
-            <CardTile key={card.identityKey} card={card} items={items} user={user}
-              onOpen={onOpen} collectionEntry/>
+        <div className="card-grid binder-grid">
+          {list.map(group => (
+            <BinderCardTile key={group.key} group={group} user={user} onOpen={onOpen}/>
           ))}
         </div>
       )}
