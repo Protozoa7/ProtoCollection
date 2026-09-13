@@ -250,3 +250,192 @@ export async function findCardForImport({ name, setName, number, lang = 'en' }) 
 export function scannerOcrLanguage(lang = 'en') {
   return languageInfo(lang).ocr
 }
+
+function editDistance(a, b) {
+  const x = compactText(a)
+  const y = compactText(b)
+  if (!x) return y.length
+  if (!y) return x.length
+  const prev = Array.from({ length: y.length + 1 }, (_, i) => i)
+  for (let i = 1; i <= x.length; i++) {
+    let last = prev[0]
+    prev[0] = i
+    for (let j = 1; j <= y.length; j++) {
+      const saved = prev[j]
+      const cost = x[i - 1] === y[j - 1] ? 0 : 1
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, last + cost)
+      last = saved
+    }
+  }
+  return prev[y.length]
+}
+
+function textSimilarity(a, b) {
+  const x = compactText(a)
+  const y = compactText(b)
+  if (!x || !y) return 0
+  if (x === y) return 1
+  if (x.includes(y) || y.includes(x)) return Math.min(x.length, y.length) / Math.max(x.length, y.length)
+  const d = editDistance(x, y)
+  return Math.max(0, 1 - d / Math.max(x.length, y.length))
+}
+
+export function extractCollectorCandidates(value) {
+  const text = String(value || '').toUpperCase().replace(/[|\\]/g, '/')
+  const out = []
+  const add = v => {
+    const cleaned = String(v || '')
+      .replace(/\s+/g, '')
+      .replace(/[Oo](?=\d)/g, '0')
+      .replace(/[Il](?=\d)/g, '1')
+      .replace(/[^A-Z0-9.-]/g, '')
+    if (cleaned && !out.includes(cleaned)) out.push(cleaned)
+  }
+
+  for (const match of text.matchAll(/\b([A-Z]{0,8}\s*\d{1,5}(?:\.\d+)?)\s*\/\s*([A-Z]{0,8}\s*\d{1,5})\b/g)) add(match[1])
+  for (const match of text.matchAll(/\b([A-Z]{1,8}\d{1,5}(?:\.\d+)?)\b/g)) add(match[1])
+  for (const match of text.matchAll(/\b(\d{1,4})\b/g)) {
+    const n = Number(match[1])
+    if (n > 0 && n < 1000) add(match[1])
+  }
+  return out.slice(0, 10)
+}
+
+function likelyNameLines(text) {
+  return String(text || '').split(/\n+/)
+    .map(v => v.trim())
+    .filter(v => v.length >= 2 && v.length <= 45)
+    .filter(v => !/^\W*\d+\W*$/.test(v))
+    .filter(v => !/\b(hp|basic|stage|trainer|energy|illus|weakness|resistance|retreat)\b/i.test(v))
+    .slice(0, 8)
+}
+
+export async function findCardSuggestionsForImport({ name, setName, number, lang = 'en', limit = 12 }) {
+  const candidates = new Map()
+  const localId = normalizeCollectorNumber(number)
+  let resolvedSet = null
+
+  if (setName) {
+    try {
+      resolvedSet = await findSetForImport(setName, lang)
+      if (resolvedSet) {
+        const fullSet = await getSet(resolvedSet.id, lang)
+        for (const card of fullSet?.cards || []) {
+          let score = 0
+          if (localId && compactText(card.localId) === compactText(localId)) score += 30
+          if (name) score += textSimilarity(card.name, name) * 18
+          if (score >= 7) candidates.set(card.id, {
+            ...card, language: lang, setId: resolvedSet.id, setName: resolvedSet.name, _reviewScore: score
+          })
+        }
+      }
+    } catch {}
+  }
+
+  if (localId) {
+    try {
+      const found = await searchByLocalId(localId, lang)
+      for (const card of found) {
+        const prior = candidates.get(card.id)
+        const score = 24 + (name ? textSimilarity(card.name, name) * 14 : 0)
+        candidates.set(card.id, { ...prior, ...card, language: lang, _reviewScore: Math.max(prior?._reviewScore || 0, score) })
+      }
+    } catch {}
+  }
+
+  if (name) {
+    try {
+      const found = await searchCards(name, lang)
+      for (const card of found.slice(0, 25)) {
+        const prior = candidates.get(card.id)
+        const score = textSimilarity(card.name, name) * 20
+        if (score >= 5) candidates.set(card.id, { ...prior, ...card, language: lang, _reviewScore: Math.max(prior?._reviewScore || 0, score) })
+      }
+    } catch {}
+  }
+
+  const ranked = [...candidates.values()]
+    .sort((a, b) => (b._reviewScore || 0) - (a._reviewScore || 0))
+    .slice(0, limit)
+
+  return Promise.all(ranked.map(async c => {
+    const full = await hydrateCard(c, lang)
+    return { ...c, ...full, language: lang, _reviewScore: c._reviewScore }
+  }))
+}
+
+export async function scanCandidatesFromRegions({ nameText = '', numberText = '', lang = 'en', setId = '', limit = 16 }) {
+  const numberCandidates = extractCollectorCandidates(numberText)
+  const nameLines = likelyNameLines(nameText)
+  const cleanNameText = norm(nameText)
+  const map = new Map()
+
+  function add(card, score, setName = '') {
+    if (!card?.id) return
+    const old = map.get(card.id)
+    const row = {
+      ...old,
+      ...card,
+      language: lang,
+      setId: card.setId || card.set?.id || setId || old?.setId || '',
+      setName: card.setName || card.set?.name || setName || old?.setName || '',
+      _scanScore: Math.max(old?._scanScore || 0, score),
+      _numberMatch: Boolean(old?._numberMatch)
+    }
+    map.set(card.id, row)
+  }
+
+  if (setId) {
+    const set = await getSet(setId, lang)
+    const cards = set?.cards || []
+    for (const card of cards) {
+      let score = 0
+      const local = compactText(card.localId)
+      const exactNumber = numberCandidates.some(n => compactText(n) === local)
+      const nearNumber = !exactNumber && numberCandidates.some(n => editDistance(n, card.localId) <= 1)
+      if (exactNumber) score += 42
+      else if (nearNumber) score += 20
+
+      let bestName = 0
+      for (const line of nameLines) bestName = Math.max(bestName, textSimilarity(card.name, line))
+      if (!bestName && cleanNameText) {
+        const n = norm(card.name)
+        if (n && cleanNameText.includes(n)) bestName = 1
+      }
+      score += bestName * 24
+
+      if (score >= 8) {
+        add({ ...card, setId: set.id, setName: set.name }, score, set.name)
+        const saved = map.get(card.id)
+        if (saved) saved._numberMatch = exactNumber
+      }
+    }
+  } else {
+    for (const number of numberCandidates.slice(0, 5)) {
+      try {
+        const found = await searchByLocalId(number, lang)
+        for (const card of found) {
+          let score = 28
+          let bestName = 0
+          for (const line of nameLines) bestName = Math.max(bestName, textSimilarity(card.name, line))
+          score += bestName * 18
+          add(card, score)
+          const saved = map.get(card.id)
+          if (saved) saved._numberMatch = compactText(card.localId) === compactText(number)
+        }
+      } catch {}
+    }
+
+    for (const line of nameLines.slice(0, 3)) {
+      try {
+        const found = await searchCards(line, lang)
+        for (const card of found.slice(0, 20)) add(card, textSimilarity(card.name, line) * 24)
+      } catch {}
+    }
+  }
+
+  return [...map.values()]
+    .filter(c => (c._scanScore || 0) >= 6)
+    .sort((a, b) => (b._scanScore || 0) - (a._scanScore || 0))
+    .slice(0, limit)
+}

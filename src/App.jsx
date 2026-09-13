@@ -1,16 +1,19 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ArrowLeft, BookOpen, Camera, Check, ChevronRight, Download, FileDown, FileUp,
-  Grid3X3, Layers3, LoaderCircle, LogIn, LogOut, Minus, Plus, Search,
-  Settings, Sparkles, X
+  AlertTriangle, ArrowLeft, BookOpen, Camera, Check, CheckCircle2, ChevronRight, Download, FileUp,
+  Grid3X3, Layers3, LoaderCircle, LogIn, LogOut, Minus, Plus, RotateCcw, Search,
+  Settings, ShieldCheck, SkipForward, Sparkles, X
 } from 'lucide-react'
 import * as XLSX from 'xlsx'
 import { createWorker } from 'tesseract.js'
 import { auth, firebaseConfigured, onAuthStateChanged, signIn, signOut } from './firebase'
-import { addCard, catalogQuantity, setQuantity, subscribeCollection } from './collectionStore'
 import {
-  assetImage, candidatesFromOcr, cardImage, findCardForImport, getSet, getSets,
-  hydrateCard, scannerOcrLanguage, searchCards
+  addCard, catalogQuantity, commitImport, rollbackImport, setQuantity,
+  subscribeCollection, subscribeImports
+} from './collectionStore'
+import {
+  assetImage, cardImage, findCardForImport, findCardSuggestionsForImport, getSet, getSets,
+  hydrateCard, scannerOcrLanguage, scanCandidatesFromRegions, searchCards
 } from './tcgdex'
 import { LANGUAGES, languageLabel, languageShort, parseLanguage } from './languages'
 
@@ -343,23 +346,136 @@ function SearchView({ items, user, onOpen }) {
   )
 }
 
+function makeRegionCanvas(source, x, y, w, h, scale = 2) {
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.round(source.width * w * scale))
+  canvas.height = Math.max(1, Math.round(source.height * h * scale))
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })
+  ctx.imageSmoothingEnabled = true
+  ctx.drawImage(
+    source,
+    source.width * x, source.height * y, source.width * w, source.height * h,
+    0, 0, canvas.width, canvas.height
+  )
+  return canvas
+}
+
+function captureGuideCard(video, canvas) {
+  const shell = video.parentElement
+  const rect = shell.getBoundingClientRect()
+  const cw = rect.width
+  const ch = rect.height
+  const guideW = Math.min(cw * 0.73, 340)
+  const guideH = guideW * (3.5 / 2.5)
+  const guideX = (cw - guideW) / 2
+  const guideY = ch * 0.46 - guideH / 2
+
+  const scale = Math.max(cw / video.videoWidth, ch / video.videoHeight)
+  const displayW = video.videoWidth * scale
+  const displayH = video.videoHeight * scale
+  const offsetX = (cw - displayW) / 2
+  const offsetY = (ch - displayH) / 2
+
+  let sx = (guideX - offsetX) / scale
+  let sy = (guideY - offsetY) / scale
+  let sw = guideW / scale
+  let sh = guideH / scale
+  sx = Math.max(0, Math.min(video.videoWidth - 1, sx))
+  sy = Math.max(0, Math.min(video.videoHeight - 1, sy))
+  sw = Math.max(1, Math.min(video.videoWidth - sx, sw))
+  sh = Math.max(1, Math.min(video.videoHeight - sy, sh))
+
+  canvas.width = 700
+  canvas.height = 980
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height)
+  return canvas
+}
+
+function dHashFromCanvas(source) {
+  const c = document.createElement('canvas')
+  c.width = 9; c.height = 14
+  const ctx = c.getContext('2d', { willReadFrequently: true })
+  ctx.drawImage(source, 0, 0, 9, 14)
+  const data = ctx.getImageData(0, 0, 9, 14).data
+  const gray = []
+  for (let i = 0; i < data.length; i += 4) gray.push(data[i] * .299 + data[i + 1] * .587 + data[i + 2] * .114)
+  const bits = []
+  for (let y = 0; y < 14; y++) for (let x = 0; x < 8; x++) bits.push(gray[y * 9 + x] > gray[y * 9 + x + 1] ? 1 : 0)
+  return bits
+}
+
+async function dHashFromUrl(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => {
+      try {
+        const c = document.createElement('canvas')
+        c.width = 245; c.height = 337
+        c.getContext('2d', { willReadFrequently: true }).drawImage(img, 0, 0, c.width, c.height)
+        resolve(dHashFromCanvas(c))
+      } catch (e) { reject(e) }
+    }
+    img.onerror = reject
+    img.src = url
+  })
+}
+
+function hashSimilarity(a, b) {
+  if (!a?.length || !b?.length || a.length !== b.length) return null
+  let same = 0
+  for (let i = 0; i < a.length; i++) if (a[i] === b[i]) same++
+  return same / a.length
+}
+
+async function rankScanByArtwork(candidates, capturedCanvas) {
+  const sourceHash = dHashFromCanvas(capturedCanvas)
+  const ranked = await Promise.all(candidates.slice(0, 14).map(async card => {
+    try {
+      const url = cardImage(card, 'low')
+      if (!url) return card
+      const similarity = hashSimilarity(sourceHash, await dHashFromUrl(url))
+      if (similarity == null) return card
+      return {
+        ...card,
+        _visualScore: similarity,
+        _combinedScore: Number(card._scanScore || 0) + similarity * 22
+      }
+    } catch {
+      return card
+    }
+  }))
+  return ranked.sort((a, b) =>
+    Number(b._combinedScore ?? b._scanScore ?? 0) - Number(a._combinedScore ?? a._scanScore ?? 0)
+  )
+}
+
 function ScannerView({ items, user, onOpen }) {
   const videoRef = useRef(null)
   const canvasRef = useRef(null)
   const streamRef = useRef(null)
   const [lang, setLang] = useState('en')
+  const [sets, setSets] = useState([])
+  const [setLock, setSetLock] = useState('')
   const [active, setActive] = useState(false)
   const [working, setWorking] = useState(false)
   const [progress, setProgress] = useState('')
   const [candidates, setCandidates] = useState([])
-  const [rawText, setRawText] = useState('')
+  const [ocr, setOcr] = useState({ name: '', number: '' })
   const [rapid, setRapid] = useState(true)
   const [lastAdded, setLastAdded] = useState('')
 
   useEffect(() => () => stopCamera(), [])
+  useEffect(() => {
+    let live = true
+    setSetLock('')
+    getSets(lang).then(v => live && setSets(v || [])).catch(() => live && setSets([]))
+    return () => { live = false }
+  }, [lang])
 
   async function startCamera() {
-    setCandidates([]); setRawText(''); setLastAdded('')
+    setCandidates([]); setOcr({ name: '', number: '' }); setLastAdded('')
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
@@ -386,28 +502,45 @@ function ScannerView({ items, user, onOpen }) {
     const video = videoRef.current
     const canvas = canvasRef.current
     if (!video || !canvas || !video.videoWidth) return
-    setWorking(true); setCandidates([]); setProgress('Capturing card…')
+    setWorking(true); setCandidates([]); setProgress('Capturing card frame…')
     try {
-      const w = video.videoWidth, h = video.videoHeight
-      canvas.width = w; canvas.height = h
-      canvas.getContext('2d').drawImage(video, 0, 0, w, h)
+      const cardCanvas = captureGuideCard(video, canvas)
+      const nameCrop = makeRegionCanvas(cardCanvas, .04, .02, .92, .23, 2.2)
+      const numberCrop = makeRegionCanvas(cardCanvas, .02, .72, .96, .27, 2.6)
 
-      setProgress(`Loading ${languageLabel(lang)} OCR…`)
+      setProgress(`Reading ${languageLabel(lang)} card name…`)
       const worker = await createWorker(scannerOcrLanguage(lang), 1, {
         logger: m => {
           if (m.status === 'recognizing text') setProgress(`Reading card… ${Math.round((m.progress || 0) * 100)}%`)
         }
       })
 
-      const { data } = await worker.recognize(canvas)
-      await worker.terminate()
-      const text = data.text || ''
-      setRawText(text)
+      await worker.setParameters({ tessedit_pageseg_mode: '6', preserve_interword_spaces: '1' })
+      const nameResult = await worker.recognize(nameCrop)
 
-      setProgress(`Matching against ${languageLabel(lang)} cards…`)
-      const found = await candidatesFromOcr(text, lang)
+      setProgress('Reading collector number…')
+      await worker.setParameters({
+        tessedit_pageseg_mode: '6',
+        tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/.-',
+        preserve_interword_spaces: '1'
+      })
+      const numberResult = await worker.recognize(numberCrop)
+      await worker.terminate()
+
+      const nameText = nameResult.data.text || ''
+      const numberText = numberResult.data.text || ''
+      setOcr({ name: nameText, number: numberText })
+
+      setProgress(setLock ? 'Matching inside the locked set…' : `Matching ${languageLabel(lang)} catalog…`)
+      let found = await scanCandidatesFromRegions({ nameText, numberText, lang, setId: setLock })
+
+      if (found.length > 1) {
+        setProgress('Comparing card artwork…')
+        found = await rankScanByArtwork(found, cardCanvas)
+      }
+
       setCandidates(found)
-      setProgress(found.length ? '' : 'No confident match. Try closer, brighter, and flatter.')
+      setProgress(found.length ? '' : 'No reliable match. Try Set Lock, reduce glare, and keep the bottom collector number sharp.')
     } catch (e) {
       setProgress(`Scan failed: ${e.message}`)
     } finally {
@@ -420,19 +553,23 @@ function ScannerView({ items, user, onOpen }) {
     await addCard(user, full, 1, { language: lang })
     setLastAdded(`${full.name} · #${full.localId} · ${languageShort(lang)}`)
     if (rapid) {
-      setCandidates([]); setRawText('')
+      setCandidates([]); setOcr({ name: '', number: '' })
       setProgress('Added. Ready for the next card.')
-      setTimeout(() => setProgress(''), 1600)
-    } else {
-      onOpen(full)
-    }
+      setTimeout(() => setProgress(''), 1500)
+    } else onOpen(full)
   }
 
   return (
     <>
-      <PageTitle eyebrow="MULTILINGUAL CAMERA SCANNER" title="Rapid Scan" subtitle="Choose the card language first. The scanner uses that language's catalog and OCR model."/>
-      <div className="language-toolbar scanner-language">
-        <span>Card language</span><LanguageSelect value={lang} onChange={setLang}/>
+      <PageTitle eyebrow="V1.2 SCANNER REBUILD" title="Rapid Scan" subtitle="Targeted name + collector-number OCR, optional Set Lock, then artwork ranking."/>
+      <div className="scanner-controls">
+        <label><span>Card language</span><LanguageSelect value={lang} onChange={setLang}/></label>
+        <label><span>Set Lock <b>recommended</b></span>
+          <select value={setLock} onChange={e => setSetLock(e.target.value)}>
+            <option value="">Any set</option>
+            {sets.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </label>
       </div>
       <div className="rapid-toggle">
         <div><strong>Rapid mode</strong><span>Stay in camera after each add</span></div>
@@ -440,8 +577,10 @@ function ScannerView({ items, user, onOpen }) {
       </div>
       <div className="scanner">
         <video ref={videoRef} playsInline muted className={active ? '' : 'hidden'} />
-        {!active && <div className="camera-empty"><Camera size={44}/><p>Use your rear camera to identify a {languageLabel(lang)} card.</p><button className="primary" onClick={startCamera}><Camera size={18}/> Open camera</button></div>}
+        {!active && <div className="camera-empty"><Camera size={44}/><p>Center one card tightly inside the frame.</p><button className="primary" onClick={startCamera}><Camera size={18}/> Open camera</button></div>}
         {active && <div className="scan-frame"><span/><span/><span/><span/></div>}
+        {active && <div className="scan-zone-label name-zone">NAME</div>}
+        {active && <div className="scan-zone-label number-zone">COLLECTOR #</div>}
         {active && <button className="camera-close" onClick={stopCamera}><X/></button>}
         {active && <button className="shutter" onClick={scanFrame} disabled={working}><span>{working ? <LoaderCircle className="spin"/> : <Camera/>}</span></button>}
       </div>
@@ -450,19 +589,153 @@ function ScannerView({ items, user, onOpen }) {
       {progress && <div className="scan-status">{working && <LoaderCircle className="spin" size={18}/>} {progress}</div>}
       {candidates.length > 0 && (
         <section className="scan-results">
-          <div className="section-heading"><div><span className="eyebrow">LIKELY {languageShort(lang)} MATCHES</span><h2>Tap the correct card</h2></div><span>{candidates.length}</span></div>
+          <div className="section-heading"><div><span className="eyebrow">RANKED MATCHES</span><h2>Tap the correct card</h2></div><span>{candidates.length}</span></div>
           <div className="candidate-grid">
-            {candidates.map(c => (
-              <button key={`${lang}-${c.id}`} onClick={() => choose(c)}>
-                {cardImage(c, 'low') && <img src={cardImage(c, 'low')} alt={c.name}/>}
-                <strong>{c.name}</strong><span>#{c.localId}</span>
+            {candidates.map((c, i) => (
+              <button key={`${lang}-${c.id}`} onClick={() => choose(c)} className={i === 0 ? 'top-candidate' : ''}>
+                {cardImage(c, 'low') && <img src={cardImage(c, 'low')} alt={c.name}/>}<strong>{c.name}</strong>
+                <span>#{c.localId}{c.setName ? ` · ${c.setName}` : ''}</span>
+                {i === 0 && <em>Best match</em>}
               </button>
             ))}
           </div>
-          <details className="ocr-details"><summary>Show OCR text</summary><pre>{rawText}</pre></details>
+          <details className="ocr-details"><summary>Scanner diagnostics</summary><pre>NAME REGION:\n{ocr.name}\n\nNUMBER REGION:\n{ocr.number}</pre></details>
         </section>
       )}
-      <div className="scanner-tip"><Sparkles/><div><strong>Scanner tip</strong><span>For Japanese, Chinese, Korean, and Thai cards, the collector number is especially valuable. Keep the bottom of the card sharp and glare-free.</span></div></div>
+      <div className="scanner-tip"><Sparkles/><div><strong>Use Set Lock whenever you can</strong><span>It turns a whole-catalog search into a small candidate pool. The scanner now reads only the name and bottom collector-number regions instead of OCRing the whole card.</span></div></div>
+    </>
+  )
+}
+
+function parseImportSourceRow(row) {
+  const name = row['Card Name'] ?? row['Name'] ?? row['Product Name'] ?? row['Product'] ?? ''
+  const setName = row['Set'] ?? row['Set Name'] ?? row['Expansion'] ?? ''
+  const number = row['Card Number'] ?? row['Number'] ?? row['Collector Number'] ?? row['#'] ?? ''
+  const quantity = Math.max(1, Number(row['Quantity'] ?? row['Qty'] ?? 1) || 1)
+  const rawLanguage = row['Language'] ?? row['LANG'] ?? row['Lang'] ?? 'ENG'
+  const lang = parseLanguage(rawLanguage, 'en')
+  const variant = row['Variant'] ?? row['HOLO'] ?? row['Finish'] ?? ''
+  const condition = row['Condition'] ?? row['Card Condition'] ?? ''
+  return { name, setName, number, quantity, rawLanguage, lang, variant, condition, source: row }
+}
+
+function ImportReview({ draft, setDraft, user, onCommitted, onCancel }) {
+  const [suggestions, setSuggestions] = useState([])
+  const [loadingSuggestions, setLoadingSuggestions] = useState(false)
+  const [manualQuery, setManualQuery] = useState('')
+  const [manualResults, setManualResults] = useState([])
+  const [committing, setCommitting] = useState(false)
+  const [message, setMessage] = useState('')
+
+  const unresolved = draft.rows.filter(r => r.status === 'review')
+  const skipped = draft.rows.filter(r => r.status === 'skipped')
+  const matched = draft.rows.filter(r => r.status === 'matched')
+  const current = unresolved[0]
+  const copies = matched.reduce((sum, r) => sum + Number(r.quantity || 0), 0)
+
+  useEffect(() => {
+    let live = true
+    setSuggestions([]); setManualResults([]); setManualQuery('')
+    if (!current) return
+    setLoadingSuggestions(true)
+    findCardSuggestionsForImport({
+      name: current.name, setName: current.setName, number: current.number, lang: current.lang || 'en'
+    }).then(v => live && setSuggestions(v)).finally(() => live && setLoadingSuggestions(false))
+    return () => { live = false }
+  }, [current?.rowId, current?.lang])
+
+  function updateRow(rowId, patch) {
+    setDraft(d => ({ ...d, rows: d.rows.map(r => r.rowId === rowId ? { ...r, ...patch } : r) }))
+  }
+
+  function choose(card) {
+    updateRow(current.rowId, { card, status: 'matched' })
+  }
+
+  async function manualSearch() {
+    if (!current || manualQuery.trim().length < 2) return
+    setLoadingSuggestions(true)
+    try {
+      const found = await searchCards(manualQuery, current.lang || 'en')
+      const hydrated = await Promise.all(found.slice(0, 16).map(c => hydrateCard(c, current.lang || 'en')))
+      setManualResults(hydrated)
+    } finally { setLoadingSuggestions(false) }
+  }
+
+  async function confirmImport() {
+    if (unresolved.length) return
+    if (!matched.length) { setMessage('No resolved rows remain to import.'); return }
+    if (!window.confirm(`Add ${copies} card copies from ${matched.length} resolved rows to your binder?`)) return
+    setCommitting(true); setMessage('Committing import…')
+    try {
+      const record = await commitImport(user, matched, { fileName: draft.fileName })
+      onCommitted(record)
+    } catch (e) {
+      setMessage(`Import failed: ${e.message}`)
+      setCommitting(false)
+    }
+  }
+
+  return (
+    <>
+      <button className="back-link" onClick={onCancel}><ArrowLeft size={18}/> Cancel import</button>
+      <PageTitle eyebrow="IMPORT STAGING" title="Review before committing" subtitle="Nothing from this file has been added to your binder yet."/>
+      <div className="import-summary-grid">
+        <div><strong>{draft.rows.length}</strong><span>source rows</span></div>
+        <div className="good"><strong>{matched.length}</strong><span>resolved</span></div>
+        <div className={unresolved.length ? 'warn' : 'good'}><strong>{unresolved.length}</strong><span>need review</span></div>
+        <div><strong>{skipped.length}</strong><span>skipped</span></div>
+      </div>
+
+      {current ? (
+        <section className="review-card">
+          <div className="review-heading">
+            <div><span className="eyebrow">REVIEW QUEUE</span><h2>{unresolved.length} remaining</h2></div>
+            <AlertTriangle/>
+          </div>
+          <div className="source-card-info">
+            <strong>{current.name || 'Unknown card name'}</strong>
+            <span>{current.setName || 'Unknown set'} · #{current.number || '?'} · {languageLabel(current.lang || 'en')} · Qty {current.quantity}</span>
+          </div>
+          <div className="review-language">
+            <span>Wrong language?</span>
+            <LanguageSelect value={current.lang || 'en'} onChange={lang => updateRow(current.rowId, { lang })}/>
+          </div>
+
+          <div className="review-section-title"><strong>Suggested matches</strong><span>Tap one to resolve this row</span></div>
+          {loadingSuggestions && !suggestions.length ? <Loading text="Finding likely matches…"/> : (
+            suggestions.length ? <div className="review-candidates">{suggestions.map(c => (
+              <button key={`${current.lang}-${c.id}`} onClick={() => choose(c)}>
+                {cardImage(c, 'low') && <img src={cardImage(c, 'low')} alt={c.name}/>}<strong>{c.name}</strong>
+                <span>#{c.localId}{c.setName ? ` · ${c.setName}` : ''}</span>
+              </button>
+            ))}</div> : <p className="muted review-no-suggest">No strong automatic suggestions. Use manual search below.</p>
+          )}
+
+          <div className="manual-review-search">
+            <div className="searchbar"><Search size={18}/><input value={manualQuery} onChange={e => setManualQuery(e.target.value)} onKeyDown={e => e.key === 'Enter' && manualSearch()} placeholder="Search this language catalog…"/></div>
+            <button className="secondary" onClick={manualSearch}>Search</button>
+          </div>
+          {manualResults.length > 0 && <div className="review-candidates manual">{manualResults.map(c => (
+            <button key={`manual-${current.lang}-${c.id}`} onClick={() => choose(c)}>
+              {cardImage(c, 'low') && <img src={cardImage(c, 'low')} alt={c.name}/>}<strong>{c.name}</strong>
+              <span>#{c.localId}{c.setName ? ` · ${c.setName}` : ''}</span>
+            </button>
+          ))}</div>}
+
+          <button className="skip-review" onClick={() => updateRow(current.rowId, { status: 'skipped' })}><SkipForward size={18}/> Skip this row</button>
+        </section>
+      ) : (
+        <div className="review-complete"><CheckCircle2/><div><strong>Review complete</strong><span>{matched.length} resolved rows · {copies} card copies ready · {skipped.length} skipped</span></div></div>
+      )}
+
+      <div className="import-commit-bar">
+        <div><strong>{copies} copies ready</strong><span>{unresolved.length ? `Resolve or skip ${unresolved.length} row${unresolved.length === 1 ? '' : 's'} first` : 'Explicit confirmation is required before anything is written'}</span></div>
+        <button className="primary" disabled={Boolean(unresolved.length) || committing || !matched.length} onClick={confirmImport}>
+          {committing ? <LoaderCircle className="spin"/> : <ShieldCheck/>} Confirm import
+        </button>
+      </div>
+      {message && <div className="import-status">{message}</div>}
     </>
   )
 }
@@ -471,14 +744,15 @@ function MoreView({ items, user }) {
   const fileRef = useRef(null)
   const [importing, setImporting] = useState(false)
   const [importStatus, setImportStatus] = useState('')
-  const [unmatched, setUnmatched] = useState([])
+  const [draft, setDraft] = useState(null)
+  const [imports, setImports] = useState([])
+  const [rollingBack, setRollingBack] = useState('')
+
+  useEffect(() => subscribeImports(user, setImports), [user])
 
   function exportCollection() {
     const rows = Object.values(items).map(x => ({
-      'Card Name': x.name,
-      'Set': x.setName,
-      'Card Number': x.localId,
-      'Quantity': x.quantity,
+      'Card Name': x.name, 'Set': x.setName, 'Card Number': x.localId, 'Quantity': x.quantity,
       'Language': languageShort(x.language || 'en'),
       'Variant': x.variant === 'Unspecified' ? '' : x.variant,
       'Condition': x.condition === 'Unspecified' ? '' : x.condition
@@ -489,92 +763,66 @@ function MoreView({ items, user }) {
     XLSX.writeFile(wb, `ProtoCollection-${new Date().toISOString().slice(0,10)}.xlsx`)
   }
 
-  function downloadUnmatched() {
-    if (!unmatched.length) return
-    const ws = XLSX.utils.json_to_sheet(unmatched)
-    const wb = XLSX.utils.book_new()
-    XLSX.utils.book_append_sheet(wb, ws, 'Needs Review')
-    XLSX.writeFile(wb, `ProtoCollection-Needs-Review-${new Date().toISOString().slice(0,10)}.xlsx`)
-  }
-
-  async function matchRow(row) {
-    const name = row['Card Name'] ?? row['Name'] ?? row['Product Name'] ?? row['Product'] ?? ''
-    const setName = row['Set'] ?? row['Set Name'] ?? row['Expansion'] ?? ''
-    const number = row['Card Number'] ?? row['Number'] ?? row['Collector Number'] ?? row['#'] ?? ''
-    const quantity = Math.max(1, Number(row['Quantity'] ?? row['Qty'] ?? 1) || 1)
-    const rawLanguage = row['Language'] ?? row['LANG'] ?? row['Lang'] ?? 'ENG'
-    const lang = parseLanguage(rawLanguage, 'en')
-    const variant = row['Variant'] ?? row['HOLO'] ?? row['Finish'] ?? ''
-    const condition = row['Condition'] ?? row['Card Condition'] ?? ''
-
-    if (!lang) {
-      return { error: `Unsupported/unknown language "${rawLanguage}"`, row }
-    }
-
-    const card = await findCardForImport({ name, setName, number, lang })
-    if (!card) {
-      return { error: `No confident ${languageLabel(lang)} catalog match`, row }
-    }
-
-    return { card, quantity, lang, variant, condition }
-  }
-
-  async function handleImport(file) {
+  async function stageImport(file) {
     if (!file) return
-    setImporting(true); setImportStatus('Reading spreadsheet…'); setUnmatched([])
+    setImporting(true); setImportStatus('Reading spreadsheet…')
     try {
       const data = await file.arrayBuffer()
       const wb = XLSX.read(data)
-      const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' })
-      let copiesAdded = 0, matchedRows = 0
-      const misses = []
+      const sourceRows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' })
+      const staged = []
 
-      for (let i = 0; i < rows.length; i++) {
-        setImportStatus(`Matching row ${i + 1} of ${rows.length}…`)
-        const result = await matchRow(rows[i])
-        if (result.card) {
-          const full = await hydrateCard(result.card, result.lang)
-          await addCard(user, full, result.quantity, {
-            language: result.lang,
-            variant: result.variant,
-            condition: result.condition
-          })
-          copiesAdded += result.quantity
-          matchedRows++
-        } else {
-          misses.push({ ...rows[i], 'ProtoCollection Review Reason': result.error })
+      for (let i = 0; i < sourceRows.length; i++) {
+        setImportStatus(`Staging row ${i + 1} of ${sourceRows.length}…`)
+        const parsed = parseImportSourceRow(sourceRows[i])
+        const rowId = `row_${i}_${Math.random().toString(36).slice(2, 7)}`
+        if (!parsed.lang) {
+          staged.push({ ...parsed, rowId, lang: 'en', status: 'review', reviewReason: `Unknown language: ${parsed.rawLanguage}` })
+          continue
         }
+        const found = await findCardForImport({ name: parsed.name, setName: parsed.setName, number: parsed.number, lang: parsed.lang })
+        const card = found ? await hydrateCard(found, parsed.lang) : null
+        staged.push({ ...parsed, rowId, status: card ? 'matched' : 'review', card })
       }
 
-      setUnmatched(misses)
-      setImportStatus(`Import complete: ${copiesAdded} copies added from ${matchedRows} rows${misses.length ? ` · ${misses.length} rows need review` : ' · no review needed'}.`)
+      setDraft({ fileName: file.name, rows: staged, createdAtMs: Date.now() })
+      const review = staged.filter(r => r.status === 'review').length
+      setImportStatus(`Staged ${staged.length} rows. ${review} need manual review. Nothing has been added yet.`)
     } catch (e) {
-      setImportStatus(`Import failed: ${e.message}`)
+      setImportStatus(`Import staging failed: ${e.message}`)
     } finally {
       setImporting(false)
       if (fileRef.current) fileRef.current.value = ''
     }
   }
 
+  async function undoImport(record) {
+    if (record.rolledBack) return
+    if (!window.confirm(`Reverse the entire import “${record.fileName}”? This will subtract exactly ${record.copiesAdded} copies that import added.`)) return
+    setRollingBack(record.importId); setImportStatus('Reversing import…')
+    try {
+      await rollbackImport(user, record)
+      setImportStatus(`Import reversed: ${record.fileName}`)
+    } catch (e) {
+      setImportStatus(`Rollback failed: ${e.message}`)
+    } finally { setRollingBack('') }
+  }
+
+  if (draft) return <ImportReview draft={draft} setDraft={setDraft} user={user}
+    onCancel={() => { setDraft(null); setImportStatus('Import canceled. Binder unchanged.') }}
+    onCommitted={record => { setDraft(null); setImportStatus(`Import committed: ${record.copiesAdded} copies added. You can reverse it from Import History.`) }}/>
+
   return (
     <>
-      <PageTitle eyebrow="TOOLS & ACCOUNT" title="More" subtitle="Import, export, sync, and account controls."/>
+      <PageTitle eyebrow="TOOLS & ACCOUNT" title="More" subtitle="Imports are now staged, reviewed, confirmed, and reversible."/>
       <div className="settings-list">
         <button className="settings-row" onClick={() => fileRef.current?.click()} disabled={importing}>
-          <span className="settings-icon"><FileUp/></span><div><strong>Import multilingual collection</strong><span>CSV/XLSX · language-aware matching</span></div><ChevronRight/>
+          <span className="settings-icon"><FileUp/></span><div><strong>Import collection</strong><span>Stage → review → confirm → reversible</span></div><ChevronRight/>
         </button>
-        <input ref={fileRef} type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={e => handleImport(e.target.files?.[0])}/>
-
+        <input ref={fileRef} type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={e => stageImport(e.target.files?.[0])}/>
         <button className="settings-row" onClick={exportCollection}>
-          <span className="settings-icon"><Download/></span><div><strong>Export collection</strong><span>Includes language, variant, and condition</span></div><ChevronRight/>
+          <span className="settings-icon"><Download/></span><div><strong>Export collection</strong><span>Download the current binder as Excel</span></div><ChevronRight/>
         </button>
-
-        {unmatched.length > 0 && (
-          <button className="settings-row review-row" onClick={downloadUnmatched}>
-            <span className="settings-icon"><FileDown/></span><div><strong>Download {unmatched.length} unmatched rows</strong><span>Keep a review file instead of losing ambiguous cards</span></div><ChevronRight/>
-          </button>
-        )}
-
         {firebaseConfigured && user && <button className="settings-row" onClick={signOut}>
           <span className="settings-icon"><LogOut/></span><div><strong>Sign out</strong><span>{user.email}</span></div><ChevronRight/>
         </button>}
@@ -582,14 +830,21 @@ function MoreView({ items, user }) {
 
       {importStatus && <div className="import-status">{importing && <LoaderCircle className="spin"/>}{importStatus}</div>}
 
-      <div className="supported-languages">
-        <strong>V1.1 catalog languages</strong>
-        <div>{ACTIVE_LANGUAGES.map(l => <span key={l.code}>{l.short}</span>)}</div>
-        <p>TCGdex completion varies by language. An unavailable card stays in the review file rather than being forced to the wrong match.</p>
-      </div>
+      <section className="import-history">
+        <div className="section-heading"><div><span className="eyebrow">V1.2+</span><h2>Import History</h2></div><span>{imports.length}</span></div>
+        {!imports.length ? <p className="muted">Imports confirmed in V1.2 will appear here and can be reversed as a whole.</p> : imports.slice(0, 12).map(record => (
+          <div className={`history-row ${record.rolledBack ? 'rolled-back' : ''}`} key={record.importId}>
+            <div><strong>{record.fileName || 'Collection import'}</strong><span>{record.copiesAdded || 0} copies · {record.uniqueEntries || record.changes?.length || 0} binder entries</span></div>
+            {record.rolledBack ? <span className="rollback-badge"><Check/> Reversed</span> : <button className="undo-btn" onClick={() => undoImport(record)} disabled={rollingBack === record.importId}>
+              {rollingBack === record.importId ? <LoaderCircle className="spin"/> : <RotateCcw/>} Reverse
+            </button>}
+          </div>
+        ))}
+      </section>
 
+      <div className="supported-languages"><strong>Multilingual catalog</strong><div>{ACTIVE_LANGUAGES.map(l => <span key={l.code}>{l.short}</span>)}</div><p>Uncertain matches stay in the review queue instead of being forced into the binder.</p></div>
       {!firebaseConfigured && <div className="setup-card"><strong>Local test mode</strong><p>Firebase has not been configured yet. Your binder is currently saved only in this browser.</p></div>}
-      {firebaseConfigured && <div className="setup-card good"><strong>Cloud sync enabled</strong><p>Firestore is configured. Language is now part of each collection entry, so English, Japanese, Chinese, etc. copies remain distinct.</p></div>}
+      {firebaseConfigured && <div className="setup-card good"><strong>Cloud sync enabled</strong><p>Confirmed V1.2 imports are recorded with exact quantity deltas so the whole import can be reversed later.</p></div>}
     </>
   )
 }

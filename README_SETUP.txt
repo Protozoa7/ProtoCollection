@@ -1,137 +1,94 @@
-ProtoCollection V1.1 — Multilingual Update
-===========================================
+ProtoCollection V1.2 — Scanner + Safe Imports
+=============================================
 
 WHAT CHANGED
 ------------
-V1.1 makes language part of your collection identity and card lookup.
+1. Imports no longer write to your binder immediately.
+   Upload -> automatic matching -> in-app review queue -> explicit Confirm Import.
 
-Added:
-- English
-- Japanese
-- Simplified Chinese
-- Traditional Chinese
-- Korean
-- Thai
-- French
-- Spanish
-- German
-- Italian
-- Portuguese (Brazil)
-- Indonesian
+2. Manual Review Queue is now inside the app.
+   For every unresolved row you can:
+   - see the original card/set/number/language
+   - choose a suggested card image
+   - change the language
+   - manually search the selected language catalog
+   - skip the row
 
-The TCGdex API recognizes additional languages too, but completion varies by language.
+3. Entire V1.2 imports can be reversed.
+   More -> Import History -> Reverse
+   The app records the exact quantity added to each binder entry and subtracts that import as one operation.
 
-IMPORTANT IF YOU ALREADY CONFIGURED FIREBASE
----------------------------------------------
-DO NOT overwrite your working src/firebaseConfig.js with the blank file from this ZIP.
+IMPORTANT: imports performed before V1.2 were not recorded with import history, so V1.2 cannot safely reverse an old V1/V1.1 import automatically.
 
-When updating the existing GitHub repo:
-1. Keep your current src/firebaseConfig.js.
-2. Replace the other V1 files with the V1.1 files.
-3. Add the new src/languages.js file.
-4. Commit to main.
-5. GitHub Actions will redeploy automatically.
+4. Scanner was rebuilt.
+   - only the NAME region is OCR'd for the card name
+   - only the lower card region is OCR'd for the collector number
+   - collector number is weighted heavily
+   - optional Set Lock restricts matches to one set
+   - likely matches are then ranked using a lightweight artwork similarity comparison when browser CORS permits it
+   - Rapid Scan remains available
 
-FILES THAT CHANGED / NEED TO BE REPLACED
-----------------------------------------
-src/App.jsx
-src/collectionStore.js
-src/tcgdex.js
-src/styles.css
-
-NEW FILE
+SET LOCK
 --------
-src/languages.js
+For best scanner accuracy:
+1. Open Scan.
+2. Choose card language.
+3. Choose the set under Set Lock whenever you know it.
+4. Center the physical card inside the guide.
+5. Keep the collector number at the bottom sharp and glare-free.
+6. Tap the shutter button.
 
-You can also replace:
-package.json
-vite.config.js
-.github/workflows/deploy.yml
+UPDATE YOUR EXISTING GITHUB REPOSITORY
+--------------------------------------
+Use the UPDATE-ONLY ZIP.
 
-The included workflow does NOT require package-lock.json.
+Replace these files/folders in your existing repo:
+- src/App.jsx
+- src/collectionStore.js
+- src/tcgdex.js
+- src/styles.css
+- package.json
+- vite.config.js
+- .github/workflows/deploy.yml
 
-MULTILINGUAL IMPORT
--------------------
-The importer now looks for a Language column (or LANG / Lang).
+Your existing files that are NOT in the update package should stay in place, especially:
+- src/firebaseConfig.js
+- src/firebase.js
+- src/languages.js
+- firestore.rules
+- public icons
 
-Examples it understands:
-ENG / EN / English -> en
-JPN / JAP / JA / Japanese -> ja
-CHN / Chinese -> zh-cn
-CHT / Traditional Chinese -> zh-tw
-KOR / Korean -> ko
-THAI -> th
-FRE / French -> fr
-SPN / Spanish -> es
-GER / German -> de
-ITA / Italian -> it
+DO NOT replace your configured src/firebaseConfig.js with a blank config.
 
-If Language is blank, the importer assumes English.
+After committing the replacements to main, GitHub Actions should rebuild automatically.
 
-Your full cleaned master CSV can now be used:
-ProtoCollection_Master_FULL_Cleaned.csv
-
-For ambiguous or unavailable cards, the importer does NOT force a match.
-It shows how many rows need review and gives you a button to download those
-unmatched rows as an Excel review file.
-
-CHINESE NOTE
-------------
-The source collection files use CHN. V1.1 maps CHN to Simplified Chinese (zh-cn),
-which is appropriate for the Chinese set codes in the supplied collection
-(CBB / CSV / CS-style releases).
-
-CARD IDENTITY
--------------
-V1 used the catalog card ID alone.
-
-V1.1 stores language + card ID + variant + condition for multilingual/detailed
-entries. Default English / unspecified entries keep the original V1 document ID,
-so existing English cards remain compatible after the update.
-
-This means an English card and Japanese card can both exist in your binder
-without overwriting one another. Imported Holo / Reverse Holo entries can also
-remain distinct.
-
-BROWSING / SEARCH
------------------
-Sets:
-Choose Catalog Language, then browse that language's set catalog.
-
-Search:
-Choose Search Language, then search by name or collector number.
-
-Binder:
-Filter by language. Each card shows a language badge.
-
-SCAN
-----
-Choose Card Language before scanning.
-
-V1.1 loads a matching OCR model:
-English -> English OCR
-Japanese -> Japanese + English OCR
-Simplified Chinese -> Simplified Chinese + English OCR
-Traditional Chinese -> Traditional Chinese + English OCR
-Korean -> Korean + English OCR
-Thai -> Thai + English OCR
-etc.
-
-Collector number is still the strongest free recognition signal, especially
-for Asian-language cards.
-
-TCGDEX AVAILABILITY
--------------------
-TCGdex is multilingual but different language databases have different levels
-of completion. If a card is not available in the selected language database,
-ProtoCollection leaves it unmatched instead of assigning the wrong card.
-
-AFTER DEPLOYING
+IMPORT WORKFLOW
 ---------------
-1. Open ProtoCollection.
-2. Go to Sets and switch between English / Japanese / Chinese.
-3. Confirm set browsing loads.
-4. Go to Search and test a collector number in each language.
-5. Go to More > Import multilingual collection.
-6. Upload ProtoCollection_Master_FULL_Cleaned.csv.
-7. Download the unmatched review file if any rows remain.
+More -> Import collection
+
+The app first stages the spreadsheet. Nothing is written to Firestore during staging.
+
+If rows need review, the Review Queue opens. Resolve each row by selecting the correct suggested card, searching manually, changing language, or explicitly skipping it.
+
+The Confirm Import button stays disabled while unresolved rows remain.
+
+When all rows are either resolved or skipped, press Confirm Import. A final confirmation prompt appears before anything is added to the binder.
+
+REVERSING AN IMPORT
+-------------------
+More -> Import History -> Reverse
+
+V1.2 stores the exact card/quantity deltas for each confirmed import. Reverse subtracts those quantities from the current binder and marks the import Reversed.
+
+For safety, one reversible import supports up to 450 unique binder entries. Larger files should be split into two imports.
+
+V1.2 does not attempt to reconstruct or reverse imports that happened in V1/V1.1 because those older versions did not store import provenance.
+
+FIREBASE
+--------
+No Firestore rule changes are required from V1.1.
+The current rule matching /users/{userId}/{document=**} already covers the new /imports subcollection.
+
+LOCAL TEST MODE
+---------------
+The same staged/confirm/reverse workflow works locally if Firebase is not configured. Local data remains browser-specific.
