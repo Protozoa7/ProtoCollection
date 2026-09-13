@@ -93,88 +93,56 @@ function CardTile({ card, items, user, onOpen, collectionEntry = false }) {
   )
 }
 
-function BinderCardTile({ group, user, onOpen }) {
-  const [busyKey, setBusyKey] = useState('')
-  const primary = group.entries[0]
-  const totalQty = group.entries.reduce((sum, entry) => sum + Number(entry.quantity || 0), 0)
+function BinderRow({ entry, user, onOpen }) {
+  const [busy, setBusy] = useState(false)
+  const qty = Number(entry.quantity || 0)
+  const variant = entry.variant && entry.variant !== 'Unspecified' ? entry.variant : 'Standard'
 
-  function variantLabel(entry) {
-    const variant = entry.variant && entry.variant !== 'Unspecified' ? entry.variant : 'Standard'
-    const condition = entry.condition && entry.condition !== 'Unspecified' ? entry.condition : ''
-    return condition ? `${variant} · ${condition}` : variant
-  }
-
-  async function adjustQuantity(e, entry, delta) {
-    e.stopPropagation()
-    const key = entry.identityKey || `${entry.language || 'en'}::${entry.cardId}`
-    setBusyKey(key)
+  async function adjust(delta) {
+    setBusy(true)
     try {
       if (delta > 0) {
         await addCard(user, entry, 1, {
           language: entry.language || 'en',
           variant: entry.variant || 'Unspecified',
-          condition: entry.condition || 'Unspecified'
+          condition: entry.condition || 'Unspecified',
+          year: entry.year,
+          rarity: entry.rarity,
+          note: entry.note
         })
       } else {
-        await setQuantity(user, entry, Math.max(0, Number(entry.quantity || 0) - 1))
+        await setQuantity(user, entry, Math.max(0, qty - 1))
       }
     } finally {
-      setBusyKey('')
+      setBusy(false)
     }
   }
 
   return (
-    <article className="card-tile binder-card-tile owned">
-      <button className="binder-card-open" onClick={() => onOpen?.(primary)} aria-label={`Open ${primary.name}`}>
-        <div className="card-image-shell">
-          {cardImage(primary, 'low')
-            ? <img src={cardImage(primary, 'low')} alt={primary.name} loading="lazy" />
-            : <div className="image-placeholder">No image</div>}
-          <span className="language-badge">{languageShort(primary.language || 'en')}</span>
-          <span className="owned-badge"><Check size={13}/> {totalQty}</span>
-        </div>
-        <div className="binder-card-heading">
-          <div className="card-name">{primary.name}</div>
-          <div className="card-sub">#{primary.localId}{primary.setName ? ` · ${primary.setName}` : ''}</div>
-        </div>
+    <div className="binder-row">
+      <button className="binder-thumb" onClick={() => onOpen?.(entry)} aria-label={`Open ${entry.name}`}>
+        {cardImage(entry, 'low') ? <img src={cardImage(entry, 'low')} alt={entry.name} loading="lazy"/> : <span>No image</span>}
       </button>
-
-      <div className="variant-list" aria-label={`${primary.name} variants`}>
-        {group.entries.map(entry => {
-          const key = entry.identityKey || `${entry.language || 'en'}::${entry.cardId}`
-          const busy = busyKey === key
-          return (
-            <div className="variant-row" key={key}>
-              <div className="variant-copy">
-                <strong>{variantLabel(entry)}</strong>
-                {group.entries.length > 1 && <span>{Number(entry.quantity || 0)} owned</span>}
-              </div>
-              <div className="mini-qty" onClick={e => e.stopPropagation()}>
-                <button
-                  type="button"
-                  className="mini-qty-btn remove"
-                  onClick={e => adjustQuantity(e, entry, -1)}
-                  disabled={busy}
-                  aria-label={`Remove one ${variantLabel(entry)}`}
-                >
-                  {busy ? <LoaderCircle className="spin" size={13}/> : <Minus size={14}/>} 
-                </button>
-                <span>{Number(entry.quantity || 0)}</span>
-                <button
-                  type="button"
-                  className="mini-qty-btn add"
-                  onClick={e => adjustQuantity(e, entry, 1)}
-                  disabled={busy}
-                  aria-label={`Add one ${variantLabel(entry)}`}
-                >
-                  {busy ? <LoaderCircle className="spin" size={13}/> : <Plus size={14}/>} 
-                </button>
-              </div>
-            </div>
-          )
-        })}
+      <div className="binder-cell card-main" data-label="CARD">
+        <strong>{entry.name}</strong>
+        <span>{entry.setName || 'Unknown set'}</span>
       </div>
-    </article>
+      <div className="binder-cell" data-label="#">{entry.localId || '—'}</div>
+      <div className="binder-cell" data-label="LANG">{languageShort(entry.language || 'en')}</div>
+      <div className="binder-cell" data-label="YEAR">{entry.year || '—'}</div>
+      <div className="binder-cell holo-cell" data-label="HOLO">{variant}</div>
+      <div className="binder-cell rarity-cell" data-label="RARITY">{entry.rarity || '—'}</div>
+      <div className="binder-cell note-cell" data-label="NOTE">{entry.note || '—'}</div>
+      <div className="binder-qty" data-label="QTY">
+        <button onClick={() => adjust(-1)} disabled={busy} aria-label={`Remove one ${entry.name}`}>
+          {busy ? <LoaderCircle className="spin" size={13}/> : <Minus size={14}/>} 
+        </button>
+        <strong>{qty}</strong>
+        <button onClick={() => adjust(1)} disabled={busy} aria-label={`Add one ${entry.name}`}>
+          {busy ? <LoaderCircle className="spin" size={13}/> : <Plus size={14}/>} 
+        </button>
+      </div>
+    </div>
   )
 }
 
@@ -246,93 +214,70 @@ function CollectionView({ items, user, onOpen }) {
   const [lang, setLang] = useState('all')
   const [sort, setSort] = useState('name')
 
-  const groups = useMemo(() => {
-    const grouped = new Map()
-    for (const entry of Object.values(items)) {
-      const groupKey = `${entry.language || 'en'}::${entry.cardId}`
-      if (!grouped.has(groupKey)) grouped.set(groupKey, { key: groupKey, entries: [] })
-      grouped.get(groupKey).entries.push(entry)
-    }
-
-    for (const group of grouped.values()) {
-      group.entries.sort((a, b) => {
-        const av = a.variant && a.variant !== 'Unspecified' ? a.variant : 'Standard'
-        const bv = b.variant && b.variant !== 'Unspecified' ? b.variant : 'Standard'
-        return av.localeCompare(bv) || String(a.condition || '').localeCompare(String(b.condition || ''))
-      })
-      group.primary = group.entries[0]
-      group.totalQty = group.entries.reduce((sum, x) => sum + Number(x.quantity || 0), 0)
-    }
-    return [...grouped.values()]
-  }, [items])
-
   const list = useMemo(() => {
     const q = query.toLowerCase().trim()
-    let out = groups.filter(group => {
-      const x = group.primary
-      const languageOk = lang === 'all' || (x.language || 'en') === lang
-      const queryOk = !q ||
-        x.name?.toLowerCase().includes(q) ||
-        x.setName?.toLowerCase().includes(q) ||
-        String(x.localId).toLowerCase().includes(q) ||
-        group.entries.some(entry =>
-          String(entry.variant || '').toLowerCase().includes(q) ||
-          String(entry.condition || '').toLowerCase().includes(q)
-        )
-      return languageOk && queryOk
+    let out = Object.values(items).filter(entry => {
+      const languageOk = lang === 'all' || (entry.language || 'en') === lang
+      const searchable = [
+        entry.name, entry.setName, entry.localId, entry.variant, entry.rarity,
+        entry.note, entry.year, languageShort(entry.language || 'en')
+      ].join(' ').toLowerCase()
+      return languageOk && (!q || searchable.includes(q))
     })
 
     out.sort((a, b) => {
-      const ax = a.primary, bx = b.primary
-      if (sort === 'qty') return b.totalQty - a.totalQty || ax.name.localeCompare(bx.name)
-      if (sort === 'set') return (ax.setName || '').localeCompare(bx.setName || '') || ax.name.localeCompare(bx.name)
-      if (sort === 'lang') return (ax.language || 'en').localeCompare(bx.language || 'en') || ax.name.localeCompare(bx.name)
-      return ax.name.localeCompare(bx.name)
+      if (sort === 'qty') return Number(b.quantity || 0) - Number(a.quantity || 0) || String(a.name).localeCompare(String(b.name))
+      if (sort === 'set') return String(a.setName || '').localeCompare(String(b.setName || '')) || String(a.name).localeCompare(String(b.name))
+      if (sort === 'year') return String(a.year || '').localeCompare(String(b.year || '')) || String(a.name).localeCompare(String(b.name))
+      if (sort === 'lang') return String(a.language || 'en').localeCompare(String(b.language || 'en')) || String(a.name).localeCompare(String(b.name))
+      return String(a.name || '').localeCompare(String(b.name || '')) || String(a.setName || '').localeCompare(String(b.setName || ''))
     })
     return out
-  }, [groups, query, lang, sort])
+  }, [items, query, lang, sort])
 
   const allEntries = Object.values(items)
   const total = allEntries.reduce((s, x) => s + Number(x.quantity || 0), 0)
-  const uniqueCards = groups.length
-  const variantCount = allEntries.length
 
   return (
     <>
-      <section className="hero">
+      <section className="hero compact-hero">
         <div>
           <span className="eyebrow">MY DIGITAL BINDER</span>
           <h1>ProtoCollection</h1>
-          <p>{uniqueCards} unique cards · {variantCount} variants · {total} total copies</p>
+          <p>{allEntries.length} binder rows · {total} total cards</p>
         </div>
         <div className="hero-orb"><Sparkles/></div>
       </section>
 
       <div className="searchbar">
         <Search size={19}/>
-        <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search cards, sets, or variants…" />
+        <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search card, set, number, holo, rarity…" />
       </div>
 
       <div className="filter-row">
         <LanguageSelect value={lang} onChange={setLang} includeAll/>
         <select value={sort} onChange={e => setSort(e.target.value)}>
-          <option value="name">Sort: Name</option>
+          <option value="name">Sort: Card</option>
           <option value="set">Sort: Set</option>
+          <option value="year">Sort: Year</option>
           <option value="qty">Sort: Quantity</option>
           <option value="lang">Sort: Language</option>
         </select>
       </div>
 
-      <div className="toolbar"><span>{list.length} cards shown</span><span className="binder-hint">Use − / + to edit copies</span></div>
+      <div className="toolbar"><span>{list.length} rows shown</span><span className="binder-hint">− / + edits copies instantly</span></div>
 
       {!list.length ? (
         <Empty icon={BookOpen} title="No cards here yet" text="Browse a set, search, scan, or import your collection."/>
       ) : (
-        <div className="card-grid binder-grid">
-          {list.map(group => (
-            <BinderCardTile key={group.key} group={group} user={user} onOpen={onOpen}/>
-          ))}
-        </div>
+        <section className="binder-sheet" aria-label="Pokémon collection binder">
+          <div className="binder-sheet-head">
+            <span></span><span>CARD</span><span>#</span><span>LANG</span><span>YEAR</span><span>HOLO</span><span>RARITY</span><span>NOTE</span><span>QTY</span>
+          </div>
+          <div className="binder-sheet-body">
+            {list.map(entry => <BinderRow key={entry.identityKey} entry={entry} user={user} onOpen={onOpen}/>)}
+          </div>
+        </section>
       )}
     </>
   )
@@ -719,15 +664,18 @@ function ScannerView({ items, user, onOpen }) {
 }
 
 function parseImportSourceRow(row) {
-  const name = row['Card Name'] ?? row['Name'] ?? row['Product Name'] ?? row['Product'] ?? ''
-  const setName = row['Set'] ?? row['Set Name'] ?? row['Expansion'] ?? ''
+  const name = row['Card Name'] ?? row['CARD'] ?? row['Name'] ?? row['Product Name'] ?? row['Product'] ?? ''
+  const setName = row['Set'] ?? row['SET'] ?? row['Set Name'] ?? row['Expansion'] ?? ''
   const number = row['Card Number'] ?? row['Number'] ?? row['Collector Number'] ?? row['#'] ?? ''
-  const quantity = Math.max(1, Number(row['Quantity'] ?? row['Qty'] ?? 1) || 1)
+  const quantity = Math.max(1, Number(row['Quantity'] ?? row['Qty'] ?? row['QTY'] ?? 1) || 1)
   const rawLanguage = row['Language'] ?? row['LANG'] ?? row['Lang'] ?? 'ENG'
   const lang = parseLanguage(rawLanguage, 'en')
   const variant = row['Variant'] ?? row['HOLO'] ?? row['Finish'] ?? ''
   const condition = row['Condition'] ?? row['Card Condition'] ?? ''
-  return { name, setName, number, quantity, rawLanguage, lang, variant, condition, source: row }
+  const year = row['Year'] ?? row['YEAR'] ?? ''
+  const rarity = row['Rarity'] ?? row['RARITY'] ?? ''
+  const note = row['Note'] ?? row['NOTE'] ?? row['Notes'] ?? ''
+  return { name, setName, number, quantity, rawLanguage, lang, variant, condition, year, rarity, note, source: row }
 }
 
 function ImportReview({ draft, setDraft, user, onCommitted, onCancel }) {
@@ -863,10 +811,15 @@ function MoreView({ items, user }) {
 
   function exportCollection() {
     const rows = Object.values(items).map(x => ({
-      'Card Name': x.name, 'Set': x.setName, 'Card Number': x.localId, 'Quantity': x.quantity,
-      'Language': languageShort(x.language || 'en'),
-      'Variant': x.variant === 'Unspecified' ? '' : x.variant,
-      'Condition': x.condition === 'Unspecified' ? '' : x.condition
+      'CARD': x.name,
+      '#': x.localId,
+      'LANG': languageShort(x.language || 'en'),
+      'YEAR': x.year || '',
+      'HOLO': x.variant === 'Unspecified' ? '' : x.variant,
+      'SET': x.setName,
+      'RARITY': x.rarity || '',
+      'NOTE': x.note || '',
+      'QTY': x.quantity
     }))
     const ws = XLSX.utils.json_to_sheet(rows)
     const wb = XLSX.utils.book_new()

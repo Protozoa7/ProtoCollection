@@ -66,12 +66,20 @@ export async function hydrateCard(card, languageOverride) {
   const lang = languageOverride || card.language || 'en'
   try {
     const full = await getCard(card.id, lang)
+    let setData = null
+    const setId = full?.set?.id || card.setId || ''
+    if (setId) {
+      try { setData = await getSet(setId, lang) } catch {}
+    }
+    const releaseDate = setData?.releaseDate || full?.set?.releaseDate || ''
     return {
       ...card,
       ...full,
       language: lang,
-      setId: full?.set?.id || card.setId || '',
-      setName: full?.set?.name || card.setName || ''
+      setId,
+      setName: setData?.name || full?.set?.name || card.setName || '',
+      year: card.year || (releaseDate ? String(releaseDate).slice(0, 4) : ''),
+      rarity: card.rarity || full?.rarity || ''
     }
   } catch {
     return { ...card, language: lang }

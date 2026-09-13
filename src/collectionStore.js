@@ -82,7 +82,10 @@ function normalizeEntry(card, quantity = 1, options = {}) {
     quantity,
     language,
     variant,
-    condition
+    condition,
+    year: String(options.year ?? card.year ?? card.releaseYear ?? '').trim(),
+    rarity: String(options.rarity ?? card.rarity ?? '').trim(),
+    note: String(options.note ?? card.note ?? card.notes ?? '').trim()
   }
 }
 
@@ -182,7 +185,10 @@ function aggregateImportRows(rows) {
     const normalized = normalizeEntry(row.card, Number(row.quantity || 1), {
       language: row.lang || row.language,
       variant: row.variant,
-      condition: row.condition
+      condition: row.condition,
+      year: row.year,
+      rarity: row.rarity,
+      note: row.note
     })
     const key = identityKey(normalized)
     const current = grouped.get(key)
@@ -218,6 +224,9 @@ export async function commitImport(user, rows, { fileName = 'Import' } = {}) {
       language: x.language,
       variant: x.variant,
       condition: x.condition,
+      year: x.year,
+      rarity: x.rarity,
+      note: x.note,
       quantity: x.quantity
     }))
   }

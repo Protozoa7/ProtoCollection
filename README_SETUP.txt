@@ -107,3 +107,7 @@ For an existing V1.2 installation, only replace:
 - package.json
 
 No Firebase changes or Firestore rule changes are required.
+
+
+V1.3 BINDER UPDATE
+The Binder now mirrors the simple PKMN MASTER LIST layout: CARD / # / LANG / YEAR / HOLO / SET / RARITY / NOTE / QTY. Quantity is editable directly on every row with minus/plus buttons. Imports preserve YEAR, RARITY and NOTE when those columns exist, and exports use the same spreadsheet-style headers.
