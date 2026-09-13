@@ -107,3 +107,32 @@ For an existing V1.2 installation, only replace:
 - package.json
 
 No Firebase changes or Firestore rule changes are required.
+
+
+V1.3 BINDER UPDATE
+The Binder now mirrors the simple PKMN MASTER LIST layout: CARD / # / LANG / YEAR / HOLO / SET / RARITY / NOTE / QTY. Quantity is editable directly on every row with minus/plus buttons. Imports preserve YEAR, RARITY and NOTE when those columns exist, and exports use the same spreadsheet-style headers.
+
+
+PROTOCOLLECTION V1.4 BINDER UPDATE
+=================================
+
+V1.4 changes the main Binder to prioritize safe, fast collection editing:
+
+- Larger card artwork on desktop and mobile.
+- One visual card group with all owned language / holo-variant rows beneath it.
+- Language is editable directly from the Binder.
+- Holo / print variant is editable directly from the Binder and includes suggested common variants.
+- Year, rarity, and notes are editable directly from the Binder.
+- Quantity can still be changed directly with - / +.
+- Card-level Lock freezes ALL currently owned rows for that card.
+- Unlocking requires confirmation.
+- When the last copy of a language/variant row is removed, an Undo bar appears so it can be restored.
+- Changing language or holo variant safely migrates/merges the Firestore identity row instead of creating a broken duplicate.
+
+For an existing V1.3 installation, replace only:
+- src/App.jsx
+- src/collectionStore.js
+- src/styles.css
+- package.json
+
+Keep your existing src/firebaseConfig.js unchanged.

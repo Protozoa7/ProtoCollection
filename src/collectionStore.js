@@ -150,7 +150,7 @@ export async function addCard(user, card, amount = 1, options = {}) {
 
   const data = readLocal()
   const existing = data[key]
-  data[key] = { ...entry, identityKey: key, quantity: Number(existing?.quantity || 0) + amount }
+  data[key] = { ...entry, identityKey: key, quantity: Number(existing?.quantity || 0) + amount, locked: Boolean(existing?.locked) }
   writeLocal(data)
   return key
 }
@@ -173,9 +173,102 @@ export async function setQuantity(user, entry, quantity) {
     }, { merge: true })
   } else {
     const data = readLocal()
-    data[key] = { ...normalized, identityKey: key, quantity }
+    data[key] = { ...normalized, identityKey: key, quantity, locked: Boolean(data[key]?.locked ?? entry.locked) }
     writeLocal(data)
   }
+}
+
+
+export async function updateEntry(user, entry, patch = {}) {
+  if (!entry) return null
+  const oldKey = entry.identityKey || identityKey(entry)
+  const merged = { ...entry, ...patch }
+  const normalized = normalizeEntry(merged, Number(entry.quantity || 1), {
+    language: patch.language ?? entry.language,
+    variant: patch.variant ?? entry.variant,
+    condition: patch.condition ?? entry.condition,
+    year: patch.year ?? entry.year,
+    rarity: patch.rarity ?? entry.rarity,
+    note: patch.note ?? entry.note
+  })
+  const newKey = identityKey(normalized)
+
+  if (firebaseConfigured && db && user) {
+    const oldRef = doc(db, 'users', user.uid, 'collection', oldKey)
+
+    if (newKey === oldKey) {
+      await setDoc(oldRef, {
+        ...normalized,
+        quantity: Number(entry.quantity || 1),
+        updatedAt: serverTimestamp()
+      }, { merge: true })
+      return newKey
+    }
+
+    const newRef = doc(db, 'users', user.uid, 'collection', newKey)
+    const target = await getDoc(newRef)
+    const targetQty = target.exists() ? Number(target.data()?.quantity || 0) : 0
+    const targetLocked = target.exists() ? Boolean(target.data()?.locked) : false
+    const batch = writeBatch(db)
+    batch.set(newRef, {
+      ...normalized,
+      quantity: targetQty + Number(entry.quantity || 1),
+      locked: Boolean(entry.locked || targetLocked),
+      updatedAt: serverTimestamp()
+    }, { merge: true })
+    batch.delete(oldRef)
+    await batch.commit()
+    return newKey
+  }
+
+  const data = readLocal()
+  if (newKey === oldKey) {
+    data[oldKey] = {
+      ...data[oldKey],
+      ...normalized,
+      identityKey: oldKey,
+      quantity: Number(entry.quantity || 1),
+      locked: Boolean(data[oldKey]?.locked ?? entry.locked)
+    }
+  } else {
+    const target = data[newKey]
+    data[newKey] = {
+      ...target,
+      ...normalized,
+      identityKey: newKey,
+      quantity: Number(target?.quantity || 0) + Number(entry.quantity || 1),
+      locked: Boolean(entry.locked || target?.locked)
+    }
+    delete data[oldKey]
+  }
+  writeLocal(data)
+  return newKey
+}
+
+export async function setCardLocked(user, entries, locked) {
+  const rows = Array.isArray(entries) ? entries.filter(Boolean) : []
+  if (!rows.length) return
+
+  if (firebaseConfigured && db && user) {
+    if (rows.length > 450) throw new Error('Too many variants to lock in one operation.')
+    const batch = writeBatch(db)
+    for (const entry of rows) {
+      const key = entry.identityKey || identityKey(entry)
+      batch.set(doc(db, 'users', user.uid, 'collection', key), {
+        locked: Boolean(locked),
+        updatedAt: serverTimestamp()
+      }, { merge: true })
+    }
+    await batch.commit()
+    return
+  }
+
+  const data = readLocal()
+  for (const entry of rows) {
+    const key = entry.identityKey || identityKey(entry)
+    if (data[key]) data[key] = { ...data[key], locked: Boolean(locked) }
+  }
+  writeLocal(data)
 }
 
 function aggregateImportRows(rows) {
